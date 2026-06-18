@@ -1,0 +1,23 @@
+{
+  "input_columns": [
+    "time_min",
+    "initial_pH",
+    "DO_setpoint",
+    "initial_glucose_g_l",
+    "AFR_setpoint",
+    "antifoam_absent",
+    "antifoam_present"
+  ],
+  "target_columns": [
+    "glucose_mol_l",
+    "biomass_g_l",
+    "DO_percent",
+    "pH"
+  ],
+  "gas_columns": [
+    "OUR_mol_min",
+    "CER_mol_min",
+    "CO2_offgas_fraction",
+    "RQ"
+  ]
+}

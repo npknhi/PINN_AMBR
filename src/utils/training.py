@@ -4,8 +4,10 @@ from __future__ import annotations
 """Training utilities for the AMBR Pseudomonas PINN flow."""
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import equinox as eqx
@@ -23,13 +25,24 @@ from src.models.pinn import (
     cardinal_pH,
     create_equinox_network,
 )
-from src.utils.dataloader import PseudomonasDataset, load_pseudomonas_splits
+from src.utils.dataloader import (
+    PseudomonasDataset,
+    load_pseudomonas_bioreactor_split,
+    load_pseudomonas_leave_one_bioreactor_out_split,
+    make_leave_one_bioreactor_out_folds,
+)
+
+
+GLUCOSE_MOLAR_MASS_G_MOL = 180.156
 
 
 @dataclass
 class TrainingConfig:
     processed_csv: str = "data/processed/ambr_preprocessed.csv"
-    experiment_id: str | None = None
+    train_experiment_ids: tuple[str, ...] | None = None
+    test_experiment_ids: tuple[str, ...] | None = None
+    validation_experiment_ids: tuple[str, ...] | None = None
+    experiment_ids: tuple[str, ...] | None = None
     results_dir: str = "results"
     experiment_name: str | None = None
     seed: int = 42
@@ -41,27 +54,51 @@ class TrainingConfig:
     residual_loss_weight: float = 1e-4
     auxiliary_loss_weight: float = 1.0
     regularization_loss_weight: float = 1e-6
+    use_auxiliary_loss: bool = True
+    use_regularization_loss: bool = True
     use_softadapt: bool = True
+    use_early_stopping: bool = False
+    early_stopping_patience: int = 1000
+    early_stopping_min_delta: float = 1e-4
+    restore_best_weights: bool = True
+    track_epoch_r2: bool = True
     obs_fit_weights: tuple[float, ...] = field(default_factory=lambda: (1.0,) * len(OBSERVABLE_COLUMNS))
     aux_fit_weights: tuple[float, ...] = field(default_factory=lambda: (1.0,) * len(PseudomonasBIOSODE.state_names))
     res_eq_weights: tuple[float, ...] = field(default_factory=lambda: (1.0,) * len(PseudomonasBIOSODE.state_names))
     reg_eq_weights: tuple[float, ...] = field(default_factory=lambda: (1.0,) * len(PseudomonasBIOSODE.state_names))
-    test_fraction: float = 0.2
-    split_strategy: str = "random"
+    loo_fold_index: int = 0
     trainable_parameters: tuple[str, ...] = tuple(PseudomonasBIOSODE.learnable_parameters)
     frozen_parameters: dict[str, float] = field(default_factory=dict)
     save_config: bool = True
     save_checkpoint: bool = True
+    validation_strategy: str = "rotate"
+    validation_seed: int | None = None
 
     def __post_init__(self) -> None:
         if self.num_epochs < 1:
             raise ValueError("num_epochs must be >= 1.")
         if self.learning_rate <= 0:
             raise ValueError("learning_rate must be > 0.")
-        if not 0.0 < self.test_fraction < 1.0:
-            raise ValueError("test_fraction must be between 0 and 1.")
-        if self.split_strategy not in {"random", "time"}:
-            raise ValueError("split_strategy must be either 'random' or 'time'.")
+        if self.loo_fold_index < 0:
+            raise ValueError("loo_fold_index must be non-negative.")
+        if self.early_stopping_patience < 1:
+            raise ValueError("early_stopping_patience must be >= 1.")
+        if self.early_stopping_min_delta < 0:
+            raise ValueError("early_stopping_min_delta must be non-negative.")
+        if self.validation_strategy not in {"rotate", "random"}:
+            raise ValueError("validation_strategy must be 'rotate' or 'random'.")
+        has_train_ids = self.train_experiment_ids is not None
+        has_test_ids = self.test_experiment_ids is not None
+        if has_train_ids != has_test_ids:
+            raise ValueError("Set both train_experiment_ids and test_experiment_ids, or neither.")
+        if has_train_ids:
+            overlap = (
+                (set(self.train_experiment_ids or ()) & set(self.test_experiment_ids or ()))
+                | (set(self.train_experiment_ids or ()) & set(self.validation_experiment_ids or ()))
+                | (set(self.validation_experiment_ids or ()) & set(self.test_experiment_ids or ()))
+            )
+            if overlap:
+                raise ValueError(f"Train, validation, and test bioreactors must be disjoint: {sorted(overlap)}")
         unknown = set(self.trainable_parameters) - set(PseudomonasBIOSODE.learnable_parameters)
         if unknown:
             raise ValueError(f"Unknown trainable parameters: {sorted(unknown)}")
@@ -75,14 +112,10 @@ def train_pinn(config: TrainingConfig | None = None) -> dict[str, Any]:
     """Train the Pseudomonas PINN on the processed AMBR table."""
 
     config = config or TrainingConfig()
-    train_dataset, test_dataset = load_pseudomonas_splits(
-        config.processed_csv,
-        input_columns=tuple(INPUT_COLUMNS),
-        experiment_id=config.experiment_id,
-        test_fraction=config.test_fraction,
-        split_strategy=config.split_strategy,
-        random_seed=config.seed,
-    )
+    train_dataset, val_dataset, test_dataset, split_metadata = _load_train_test_datasets(config)
+    score_dataset = val_dataset or test_dataset
+    if config.use_early_stopping and val_dataset is None:
+        raise ValueError("Early stopping requires a validation split.")
 
     key = jax.random.PRNGKey(config.seed)
     model = create_equinox_network(
@@ -97,7 +130,7 @@ def train_pinn(config: TrainingConfig | None = None) -> dict[str, Any]:
     theta_raw = _initial_theta_raw(active_names)
 
     arrays = _device_arrays(train_dataset, config)
-    test_arrays = _device_arrays(test_dataset, config)
+    val_arrays = _device_arrays(score_dataset, config)
     opt = optax.adam(config.learning_rate)
     params = (model, theta_raw)
     opt_state = opt.init(eqx.filter(params, eqx.is_array))
@@ -116,9 +149,16 @@ def train_pinn(config: TrainingConfig | None = None) -> dict[str, Any]:
         params = eqx.apply_updates(params, updates)
         return params, opt_state, loss_value, components
 
+    @eqx.filter_jit
+    def validation_data_loss(params):
+        model_current, _ = params
+        states = _constrained_states(model_current, val_arrays["x"], val_arrays["volume_l"], val_arrays)
+        return _data_loss(states, val_arrays)
+
     history: dict[str, list[float]] = {
         "loss": [],
         "data_loss": [],
+        "val_data_loss": [],
         "residual_loss": [],
         "auxiliary_loss": [],
         "regularization_loss": [],
@@ -145,20 +185,33 @@ def train_pinn(config: TrainingConfig | None = None) -> dict[str, Any]:
     stored_residual_loss = jnp.zeros((config.num_epochs,), dtype=jnp.float32)
     stored_auxiliary_loss = jnp.zeros((config.num_epochs,), dtype=jnp.float32)
     stored_regularization_loss = jnp.zeros((config.num_epochs,), dtype=jnp.float32)
+    best_params = params
+    best_val_data_loss = float("inf")
+    best_epoch = -1
+    epochs_without_improvement = 0
 
     for epoch in range(config.num_epochs):
         params, opt_state, loss_value, components = train_step(params, opt_state, softadapt_weights)
+        val_data_loss = validation_data_loss(params)
         history["loss"].append(float(loss_value))
+        history["val_data_loss"].append(float(val_data_loss))
         for name, value in components.items():
             history[name].append(float(value))
-        model_current, _ = params
-        train_r2 = _observable_r2_by_target(model_current, arrays, train_dataset.target_columns)
-        val_r2 = _observable_r2_by_target(model_current, test_arrays, test_dataset.target_columns)
-        history["r2_scores_train"].append(_mean_r2(train_r2.values()))
-        history["r2_scores_val"].append(_mean_r2(val_r2.values()))
-        for column in train_dataset.target_columns:
-            history[f"r2_train_{column}"].append(train_r2[column])
-            history[f"r2_val_{column}"].append(val_r2[column])
+        if config.track_epoch_r2:
+            model_current, _ = params
+            train_r2 = _observable_r2_by_target(model_current, arrays, train_dataset.target_columns)
+            val_r2 = _observable_r2_by_target(model_current, val_arrays, score_dataset.target_columns)
+            history["r2_scores_train"].append(_mean_r2(train_r2.values()))
+            history["r2_scores_val"].append(_mean_r2(val_r2.values()))
+            for column in train_dataset.target_columns:
+                history[f"r2_train_{column}"].append(train_r2[column])
+                history[f"r2_val_{column}"].append(val_r2[column])
+        else:
+            history["r2_scores_train"].append(float("nan"))
+            history["r2_scores_val"].append(float("nan"))
+            for column in train_dataset.target_columns:
+                history[f"r2_train_{column}"].append(float("nan"))
+                history[f"r2_val_{column}"].append(float("nan"))
         history["softadapt_data_weight"].append(float(softadapt_weights[0]))
         history["softadapt_residual_weight"].append(float(softadapt_weights[1]))
         history["softadapt_auxiliary_weight"].append(float(softadapt_weights[2]))
@@ -187,22 +240,40 @@ def train_pinn(config: TrainingConfig | None = None) -> dict[str, Any]:
             )
             softadapt_weights = jnp.asarray(softadapt_weights, dtype=jnp.float32)
 
+        if config.use_early_stopping:
+            current_val_data_loss = float(val_data_loss)
+            if current_val_data_loss < best_val_data_loss - config.early_stopping_min_delta:
+                best_val_data_loss = current_val_data_loss
+                best_params = params
+                best_epoch = epoch
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+                if epochs_without_improvement >= config.early_stopping_patience:
+                    break
+
+    if config.use_early_stopping:
+        history["best_epoch"] = [float(best_epoch)] * len(history["loss"])
+        history["best_val_data_loss"] = [float(best_val_data_loss)] * len(history["loss"])
+        if config.restore_best_weights:
+            params = best_params
+
     model, theta_raw = params
     ode_params = _build_ode_params(theta_raw, active_names, config.frozen_parameters)
     learned_params = {name: ode_params[name] for name in active_names}
     learned_params.update({name: float(value) for name, value in config.frozen_parameters.items()})
     train_predictions = predict_dataset(model, train_dataset)
     test_predictions = predict_dataset(model, test_dataset)
-    train_gas_predictions = predict_gas_dataset(model, train_dataset, learned_params)
-    test_gas_predictions = predict_gas_dataset(model, test_dataset, learned_params)
-
     output_dir = _output_dir_from_config(config)
     output_dir.mkdir(parents=True, exist_ok=True)
     train_dataset = replace(train_dataset, output_dir=str(output_dir))
+    if val_dataset is not None:
+        val_dataset = replace(val_dataset, output_dir=str(output_dir))
     test_dataset = replace(test_dataset, output_dir=str(output_dir))
     result = {
         "config": config,
         "train_dataset": train_dataset,
+        "val_dataset": val_dataset,
         "test_dataset": test_dataset,
         "model": model,
         "theta_raw": np.asarray(theta_raw),
@@ -210,35 +281,282 @@ def train_pinn(config: TrainingConfig | None = None) -> dict[str, Any]:
         "history": history,
         "train_predictions": train_predictions,
         "test_predictions": test_predictions,
-        "train_gas_predictions": train_gas_predictions,
-        "test_gas_predictions": test_gas_predictions,
+        "split_metadata": split_metadata,
         "output_dir": str(output_dir),
     }
     if config.save_config:
-        save_training_config(config, output_dir / "config.json")
+        save_training_config(config, output_dir / "config.json", split_metadata=split_metadata)
     if config.save_checkpoint:
         save_checkpoint(result, output_dir / "checkpoints")
     return result
 
 
+def _load_train_test_datasets(
+    config: TrainingConfig,
+) -> tuple[PseudomonasDataset, PseudomonasDataset | None, PseudomonasDataset, dict[str, object]]:
+    if config.train_experiment_ids is not None and config.test_experiment_ids is not None:
+        return load_pseudomonas_bioreactor_split(
+            config.processed_csv,
+            input_columns=tuple(INPUT_COLUMNS),
+            train_experiment_ids=config.train_experiment_ids,
+            validation_experiment_ids=config.validation_experiment_ids or (),
+            test_experiment_ids=config.test_experiment_ids,
+        )
+
+    return load_pseudomonas_leave_one_bioreactor_out_split(
+        config.processed_csv,
+        input_columns=tuple(INPUT_COLUMNS),
+        experiment_ids=config.experiment_ids,
+        fold_index=config.loo_fold_index,
+        validation_strategy=config.validation_strategy,
+        validation_seed=config.seed if config.validation_seed is None else config.validation_seed,
+    )
+
+
+def _append_csv_frame(path: Path, frame) -> None:
+    frame.to_csv(path, mode="a", header=not path.exists(), index=False)
+
+
+def _append_csv_row(path: Path, row: dict[str, object]) -> None:
+    import pandas as pd
+
+    _append_csv_frame(path, pd.DataFrame([row]))
+
+
+def _remove_existing_fold_seed_rows(path: Path, fold_index: int, seed: int) -> None:
+    if not path.exists():
+        return
+
+    import pandas as pd
+
+    frame = pd.read_csv(path)
+    if frame.empty or "fold_index" not in frame.columns or "seed" not in frame.columns:
+        return
+    keep = ~(
+        pd.to_numeric(frame["fold_index"], errors="coerce").eq(int(fold_index))
+        & pd.to_numeric(frame["seed"], errors="coerce").eq(int(seed))
+    )
+    frame.loc[keep].to_csv(path, index=False)
+
+
+def run_leave_one_bioreactor_out(
+    config: TrainingConfig | None = None,
+    seeds: Sequence[int] | None = None,
+    fold_indices: Sequence[int] | None = None,
+    keep_results: bool = False,
+) -> dict[str, Any]:
+    """Run leave-one-bioreactor-out benchmarking for PINN.
+
+    Each fold holds out one complete bioreactor, repeated across random seeds,
+    with metrics saved as long-form and mean/std summary CSV files.
+    """
+
+    import pandas as pd
+
+    from src.utils.evaluation import (
+        OBSERVABLE_TABLE_LABELS,
+        evaluate_observables,
+        save_reports,
+    )
+
+    base_config = config or TrainingConfig()
+    if base_config.train_experiment_ids is not None or base_config.test_experiment_ids is not None:
+        raise ValueError("run_leave_one_bioreactor_out expects experiment_ids, not explicit train/test ids.")
+    seed_values = tuple(int(seed) for seed in (seeds or (base_config.seed,)))
+    base_name = (base_config.experiment_name or "leave_one_bioreactor_out").strip()
+    output_dir = Path(base_config.results_dir) / base_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    metrics_long_path = output_dir / "leave_one_out_metrics_long.csv"
+    runtime_path = output_dir / "leave_one_out_runtime.csv"
+    table_path = output_dir / "leave_one_out_table.csv"
+    fold_frame = _selected_experiment_frame(base_config.processed_csv, base_config.experiment_ids)
+    folds = make_leave_one_bioreactor_out_folds(fold_frame)
+    all_experiment_ids = [experiment_id for fold in folds for experiment_id in fold]
+    selected_fold_indices = None if fold_indices is None else {int(index) for index in fold_indices}
+    if selected_fold_indices is not None:
+        invalid_fold_indices = sorted(index for index in selected_fold_indices if index < 0 or index >= len(folds))
+        if invalid_fold_indices:
+            raise ValueError(
+                f"fold_indices contains invalid fold(s): {invalid_fold_indices}. "
+                f"Valid range is 0 to {len(folds) - 1}."
+            )
+
+    metric_frames = []
+    runtime_rows = []
+    kept_results = []
+    for fold_index, test_ids in enumerate(folds):
+        if selected_fold_indices is not None and fold_index not in selected_fold_indices:
+            continue
+        test_label = "_".join(test_ids)
+        for seed in seed_values:
+            run_config = replace(
+                base_config,
+                seed=seed,
+                results_dir=str(output_dir),
+                experiment_ids=tuple(all_experiment_ids),
+                loo_fold_index=fold_index,
+                experiment_name=f"fold_{fold_index}_{test_label}_seed_{seed}",
+            )
+            train_start = perf_counter()
+            result = train_pinn(run_config)
+            training_time_s = perf_counter() - train_start
+            inference_start = perf_counter()
+            predict_dataset(result["model"], result["test_dataset"])
+            inference_time_s = perf_counter() - inference_start
+            save_reports(result)
+            _remove_existing_fold_seed_rows(runtime_path, fold_index, seed)
+            _remove_existing_fold_seed_rows(metrics_long_path, fold_index, seed)
+            runtime_row = {
+                "fold_index": fold_index,
+                "seed": seed,
+                "training_time_s": float(training_time_s),
+                "inference_time_s": float(inference_time_s),
+            }
+            runtime_rows.append(runtime_row)
+            _append_csv_row(runtime_path, runtime_row)
+            datasets = [("train", result["train_dataset"])]
+            if result.get("val_dataset") is not None:
+                datasets.append(("val", result["val_dataset"]))
+            fold_metric_frames = []
+            datasets.append(("test", result["test_dataset"]))
+            for split_name, dataset in datasets:
+                metrics = evaluate_observables(result["model"], dataset)
+                metrics.insert(0, "split", split_name)
+                metrics.insert(0, "seed", seed)
+                metrics.insert(0, "fold_index", fold_index)
+                fold_metric_frames.append(metrics)
+                metric_frames.append(metrics)
+            _append_csv_frame(metrics_long_path, pd.concat(fold_metric_frames, ignore_index=True))
+            if keep_results:
+                kept_results.append(result)
+    if metrics_long_path.exists():
+        metrics_long = pd.read_csv(metrics_long_path)
+    else:
+        metrics_long = pd.concat(metric_frames, ignore_index=True) if metric_frames else pd.DataFrame()
+    if runtime_path.exists():
+        runtime = pd.read_csv(runtime_path)
+    else:
+        runtime = pd.DataFrame(runtime_rows)
+    table = _v1_metric_table(
+        metrics_long,
+        benchmark="Leave-One-Bioreactor-Out",
+        observable_labels=OBSERVABLE_TABLE_LABELS,
+    )
+    table.to_csv(table_path, index=False)
+
+    return {
+        "output_dir": str(output_dir),
+        "metrics_long": metrics_long,
+        "runtime": runtime,
+        "table": table,
+        "paths": {
+            "metrics_long": metrics_long_path,
+            "runtime": runtime_path,
+            "table": table_path,
+        },
+        "results": kept_results,
+    }
+
+
+def _selected_experiment_frame(processed_csv: str | Path, experiment_ids: Sequence[str] | None) -> "pd.DataFrame":
+    import pandas as pd
+
+    frame = pd.read_csv(processed_csv, usecols=["Experiment_id"])
+    frame["Experiment_id"] = frame["Experiment_id"].astype(str)
+    if experiment_ids is None:
+        return frame.drop_duplicates().reset_index(drop=True)
+
+    selected = tuple(str(experiment_id) for experiment_id in experiment_ids)
+    if not selected:
+        raise ValueError("experiment_ids must not be empty.")
+    available = set(frame["Experiment_id"].unique())
+    missing = sorted(set(selected) - available)
+    if missing:
+        raise ValueError(f"Unknown Experiment_id values: {missing}")
+    return frame[frame["Experiment_id"].isin(selected)].drop_duplicates().reset_index(drop=True)
+
+
+def _v1_metric_table(
+    metrics: "pd.DataFrame",
+    *,
+    benchmark: str,
+    observable_labels: dict[str, str],
+) -> "pd.DataFrame":
+    import pandas as pd
+
+    columns = [
+        "Benchmark",
+        "Observable",
+        "R2 mean",
+        "R2 median",
+        "R2 std",
+        "MAE mean",
+        "MAE median",
+        "MAE std",
+        "NRMSE mean",
+        "NRMSE median",
+        "NRMSE std",
+    ]
+    if metrics.empty:
+        return pd.DataFrame(columns=columns)
+
+    test_metrics = metrics[metrics["split"].eq("test")].copy()
+    grouped = (
+        test_metrics.groupby("observable", dropna=False)[["r2", "mae", "nrmse"]]
+        .agg(["mean", "median", "std"])
+        .reset_index()
+    )
+    grouped.columns = _flatten_columns(grouped.columns)
+
+    grouped["Benchmark"] = benchmark
+    grouped["Observable"] = grouped["observable"].map(lambda value: observable_labels.get(str(value), str(value)))
+    grouped = grouped.rename(
+        columns={
+            "r2_mean": "R2 mean",
+            "r2_median": "R2 median",
+            "r2_std": "R2 std",
+            "mae_mean": "MAE mean",
+            "mae_median": "MAE median",
+            "mae_std": "MAE std",
+            "nrmse_mean": "NRMSE mean",
+            "nrmse_median": "NRMSE median",
+            "nrmse_std": "NRMSE std",
+        }
+    )
+    return grouped.loc[:, columns]
+
+
+def _flatten_columns(columns: Any) -> list[str]:
+    flattened = []
+    for column in columns:
+        if isinstance(column, tuple):
+            flattened.append("_".join(str(part) for part in column if part))
+        else:
+            flattened.append(str(column))
+    return flattened
+
+
 def _output_dir_from_config(config: TrainingConfig) -> Path:
     experiment_name = (config.experiment_name or "").strip()
-    prefix = "pseudomonas_pinn_"
-    if experiment_name.startswith(prefix):
-        experiment_name = experiment_name[len(prefix):]
-    elif experiment_name == "pseudomonas_pinn":
-        experiment_name = ""
-
     if not experiment_name:
-        experiment_name = config.experiment_id or "AMBR_all"
+        if config.train_experiment_ids is not None and config.test_experiment_ids is not None:
+            train_label = "_".join(config.train_experiment_ids)
+            test_label = "_".join(config.test_experiment_ids)
+            experiment_name = f"{train_label}_to_{test_label}"
+        else:
+            experiment_name = f"leave_one_bioreactor_out_fold_{config.loo_fold_index}"
 
     return Path(config.results_dir) / experiment_name
 
 
-def save_training_config(config: TrainingConfig, output_path: str | Path) -> Path:
+def save_training_config(
+    config: TrainingConfig,
+    output_path: str | Path,
+    split_metadata: dict[str, object] | None = None,
+) -> Path:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(_config_json_payload(config), indent=2), encoding="utf-8")
+    output_path.write_text(json.dumps(_config_json_payload(config, split_metadata), indent=2), encoding="utf-8")
     return output_path
 
 
@@ -251,39 +569,77 @@ def save_checkpoint(result: dict[str, Any], checkpoint_dir: str | Path | None = 
     theta_path = checkpoint_dir / "theta_raw.npy"
     learned_params_path = checkpoint_dir / "learned_params.json"
     history_path = checkpoint_dir / "history.csv"
+    scaler_path = checkpoint_dir / "scalers.npz"
+    columns_path = checkpoint_dir / "dataset_columns.json"
 
     eqx.tree_serialise_leaves(model_path, result["model"])
     np.save(theta_path, np.asarray(result["theta_raw"]))
     learned_params_path.write_text(json.dumps(result["learned_params"], indent=2), encoding="utf-8")
     _history_frame(result["history"]).to_csv(history_path, index=False)
+    train_dataset = result["train_dataset"]
+    np.savez_compressed(
+        scaler_path,
+        x_mean=np.asarray(train_dataset.x_mean),
+        x_std=np.asarray(train_dataset.x_std),
+        target_scale=np.asarray(train_dataset.target_scale),
+        state_scale=np.asarray(train_dataset.state_scale),
+        gas_scale=np.asarray(train_dataset.gas_scale),
+    )
+    columns_path.write_text(
+        json.dumps(
+            {
+                "input_columns": list(train_dataset.input_columns),
+                "target_columns": list(train_dataset.target_columns),
+                "gas_columns": list(train_dataset.gas_columns),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
     return {
         "model": model_path,
         "theta_raw": theta_path,
         "learned_params": learned_params_path,
         "history": history_path,
+        "scalers": scaler_path,
+        "dataset_columns": columns_path,
     }
 
 
-def _config_json_payload(config: TrainingConfig) -> dict[str, Any]:
-    return {
+def _config_json_payload(config: TrainingConfig, split_metadata: dict[str, object] | None = None) -> dict[str, Any]:
+    payload = {
         "data": {
             "processed_csv": config.processed_csv,
-            "experiment_id": config.experiment_id,
-            "test_fraction": float(config.test_fraction),
-            "split_strategy": config.split_strategy,
+            "train_experiment_ids": list(config.train_experiment_ids) if config.train_experiment_ids is not None else None,
+            "validation_experiment_ids": list(config.validation_experiment_ids)
+            if config.validation_experiment_ids is not None
+            else None,
+            "test_experiment_ids": list(config.test_experiment_ids) if config.test_experiment_ids is not None else None,
+            "split_strategy": "bioreactor_id"
+            if config.train_experiment_ids is not None and config.test_experiment_ids is not None
+            else "leave_one_bioreactor_out",
+            "validation_strategy": config.validation_strategy,
+            "validation_seed": config.seed if config.validation_seed is None else int(config.validation_seed),
+            "fold_index": int(config.loo_fold_index),
         },
         "model": {
             "n_neurons": int(config.n_neurons),
             "n_hidden_layers": int(config.n_hidden_layers),
             "trainable_parameters": list(config.trainable_parameters),
-            "frozen_parameters": {name: float(value) for name, value in config.frozen_parameters.items()},
         },
         "training": {
             "seed": int(config.seed),
             "num_epochs": int(config.num_epochs),
             "learning_rate": float(config.learning_rate),
+            "use_auxiliary_loss": bool(config.use_auxiliary_loss),
+            "use_regularization_loss": bool(config.use_regularization_loss),
             "use_softadapt": bool(config.use_softadapt),
+            "use_early_stopping": bool(config.use_early_stopping),
+            "early_stopping_patience": int(config.early_stopping_patience),
+            "early_stopping_min_delta": float(config.early_stopping_min_delta),
+            "restore_best_weights": bool(config.restore_best_weights),
+            "track_epoch_r2": bool(config.track_epoch_r2),
             "save_config": bool(config.save_config),
             "save_checkpoint": bool(config.save_checkpoint),
         },
@@ -297,11 +653,26 @@ def _config_json_payload(config: TrainingConfig) -> dict[str, Any]:
             "res_eq_weights": [float(value) for value in config.res_eq_weights],
             "reg_eq_weights": [float(value) for value in config.reg_eq_weights],
         },
-        "output": {
-            "results_dir": config.results_dir,
-            "experiment_name": config.experiment_name,
-        },
     }
+    if config.frozen_parameters:
+        payload["model"]["frozen_parameters"] = {
+            name: float(value) for name, value in config.frozen_parameters.items()
+        }
+    if split_metadata is not None:
+        data = payload["data"]
+        for key in (
+            "split_strategy",
+            "n_splits",
+            "fold_index",
+            "validation_strategy",
+            "validation_seed",
+            "train_experiment_ids",
+            "validation_experiment_ids",
+            "test_experiment_ids",
+        ):
+            if key in split_metadata:
+                data[key] = split_metadata[key]
+    return payload
 
 
 def _history_frame(history: dict[str, list[float]]) -> "pd.DataFrame":
@@ -311,28 +682,19 @@ def _history_frame(history: dict[str, list[float]]) -> "pd.DataFrame":
 
 
 def predict_dataset(model, dataset: PseudomonasDataset) -> dict[str, np.ndarray]:
-    states = jax.vmap(model)(jnp.asarray(dataset.x, dtype=jnp.float32))
+    arrays = _device_arrays(dataset)
+    states = _constrained_states(model, arrays["x"], arrays["volume_l"], arrays)
     states_np = np.asarray(states)
     predictions = {name: states_np[:, idx] for name, idx in PseudomonasBIOSODE.state_index.items()}
     volume = np.maximum(dataset.volume_l, 1e-12)
     predictions["glucose_mol_l"] = predictions["Substrate"] / volume
+    predictions["glucose_g_l"] = predictions["glucose_mol_l"] * GLUCOSE_MOLAR_MASS_G_MOL
     predictions["biomass_g_l"] = predictions["Biomass"] / volume
     predictions["O2_l_mol"] = predictions["O2_l"]
+    predictions["DO_percent"] = np.asarray(_do_percent_from_o2_l(jnp.asarray(predictions["O2_l"]), jnp.asarray(volume)))
     h_mol_l = predictions["H"] / volume
     predictions["pH"] = -np.log10(np.maximum(h_mol_l, 1e-14))
     return predictions
-
-
-def predict_gas_dataset(
-    model,
-    dataset: PseudomonasDataset,
-    ode_params: dict[str, float | jnp.ndarray],
-) -> dict[str, np.ndarray]:
-    states = jax.vmap(model)(jnp.asarray(dataset.x, dtype=jnp.float32))
-    arrays = _device_arrays(dataset)
-    pred = _gas_predictions(states, {**PseudomonasBIOSODE.default_parameters, **ode_params}, arrays)
-    pred_np = np.asarray(pred)
-    return {name: pred_np[:, idx] for idx, name in enumerate(dataset.gas_columns)}
 
 
 def _loss(
@@ -345,15 +707,24 @@ def _loss(
 ) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
     model, theta_raw = params
     ode_params = _build_ode_params(theta_raw, active_names, frozen_parameters)
-    states = jax.vmap(model)(arrays["x"])
+    states = _constrained_states(model, arrays["x"], arrays["volume_l"], arrays)
 
     data_loss = _data_loss(states, arrays)
     residual_loss = _residual_loss(model, ode_params, arrays)
-    auxiliary_loss = _auxiliary_loss(model, arrays)
-    regularization_loss = _regularization_loss(model, ode_params, arrays)
+    auxiliary_loss = _auxiliary_loss(model, arrays) if config.use_auxiliary_loss else jnp.asarray(0.0, dtype=jnp.float32)
+    regularization_loss = (
+        _regularization_loss(model, ode_params, arrays)
+        if config.use_regularization_loss
+        else jnp.asarray(0.0, dtype=jnp.float32)
+    )
+    active_loss_mask = jnp.asarray(
+        [True, True, config.use_auxiliary_loss, config.use_regularization_loss],
+        dtype=jnp.float32,
+    )
 
     total = jnp.sum(
         softadapt_weights
+        * active_loss_mask
         * jnp.asarray(
             [
                 data_loss,
@@ -386,7 +757,7 @@ def _observable_r2_by_target(
     arrays: dict[str, jnp.ndarray],
     target_columns: tuple[str, ...],
 ) -> dict[str, float]:
-    states = jax.vmap(model)(arrays["x"])
+    states = _constrained_states(model, arrays["x"], arrays["volume_l"], arrays)
     pred = _observable_matrix(states, arrays["volume_l"])
     y_true = np.asarray(arrays["y"])
     y_pred = np.asarray(pred)
@@ -404,7 +775,7 @@ def _observable_r2_by_target(
             scores[column] = float("nan")
         else:
             r2 = 1.0 - np.sum((true_values - pred_values) ** 2) / denom
-            scores[column] = float(np.clip(r2, 0.0, 1.0))
+            scores[column] = float(max(0.0, r2))
     return scores
 
 
@@ -420,11 +791,79 @@ def _observable_matrix(states: jnp.ndarray, volume_l: jnp.ndarray) -> jnp.ndarra
         [
             states[:, STATE_INDEX["Substrate"]] / volume,
             states[:, STATE_INDEX["Biomass"]] / volume,
-            states[:, STATE_INDEX["O2_l"]],
+            _do_percent_from_o2_l(states[:, STATE_INDEX["O2_l"]], volume),
             -jnp.log10(jnp.maximum(h_mol_l, 1e-14)),
         ],
         axis=1,
     )
+
+
+def _constrained_states(
+    model,
+    x: jnp.ndarray,
+    volume_l: jnp.ndarray,
+    arrays: dict[str, jnp.ndarray],
+) -> jnp.ndarray:
+    raw_states = jax.vmap(model)(x)
+    return _apply_hard_initial_constraints(raw_states, x, volume_l, arrays)
+
+
+def _constrained_state(
+    model,
+    xi: jnp.ndarray,
+    volume_l: jnp.ndarray,
+    arrays: dict[str, jnp.ndarray],
+) -> jnp.ndarray:
+    raw_state = model(xi)
+    constrained = _apply_hard_initial_constraints(
+        raw_state[jnp.newaxis, :],
+        xi[jnp.newaxis, :],
+        jnp.asarray([volume_l], dtype=raw_state.dtype),
+        arrays,
+    )
+    return constrained[0]
+
+
+def _apply_hard_initial_constraints(
+    states: jnp.ndarray,
+    x: jnp.ndarray,
+    volume_l: jnp.ndarray,
+    arrays: dict[str, jnp.ndarray],
+) -> jnp.ndarray:
+    """Apply hard condition constraints from experiment inputs."""
+
+    time_idx = arrays["time_column_index"]
+    glucose_idx = arrays["initial_glucose_column_index"]
+    ph_idx = arrays["initial_ph_column_index"]
+    do_idx = arrays["do_setpoint_column_index"]
+
+    time_phys = x[:, time_idx] * arrays["x_std"][time_idx] + arrays["x_mean"][time_idx]
+    is_initial_time = time_phys <= arrays["time_x_mean"] + 1e-6
+
+    initial_glucose_g_l = x[:, glucose_idx] * arrays["x_std"][glucose_idx] + arrays["x_mean"][glucose_idx]
+    initial_ph = x[:, ph_idx] * arrays["x_std"][ph_idx] + arrays["x_mean"][ph_idx]
+    do_setpoint = x[:, do_idx] * arrays["x_std"][do_idx] + arrays["x_mean"][do_idx]
+    volume = jnp.maximum(volume_l, 1e-12)
+    initial_substrate = (initial_glucose_g_l / GLUCOSE_MOLAR_MASS_G_MOL) * volume
+    initial_h = (10.0 ** (-initial_ph)) * volume
+    # DO setpoint is treated as a lower operating target.
+    do_margin = 0.0
+    do_lower_percent = jnp.maximum(do_setpoint - do_margin, 0.0)
+    p = PseudomonasBIOSODE.default_parameters
+    saturation_o2_l_mol = p["FractionO2"] * p["Pr"] * p["HenryConstantO2"] * volume
+    do_lower_o2_l = (do_lower_percent / 100.0) * saturation_o2_l_mol
+    do_smooth_scale = jnp.maximum(0.01 * saturation_o2_l_mol, 1e-12)
+
+    substrate_idx = STATE_INDEX["Substrate"]
+    h_idx = STATE_INDEX["H"]
+    o2_idx = STATE_INDEX["O2_l"]
+    substrate = jnp.where(is_initial_time, initial_substrate, states[:, substrate_idx])
+    h = jnp.where(is_initial_time, initial_h, states[:, h_idx])
+    o2_l = do_lower_o2_l + do_smooth_scale * jax.nn.softplus((states[:, o2_idx] - do_lower_o2_l) / do_smooth_scale)
+    states = states.at[:, substrate_idx].set(jnp.maximum(substrate, 0.0))
+    states = states.at[:, h_idx].set(jnp.maximum(h, 1e-14 * volume))
+    states = states.at[:, o2_idx].set(o2_l)
+    return states
 
 
 def _residual_loss(
@@ -473,13 +912,47 @@ def _gas_predictions(
 
 
 def _auxiliary_loss(model, arrays: dict[str, jnp.ndarray]) -> jnp.ndarray:
-    pred = jax.vmap(model)(arrays["boundary_x"])
-    residual = (pred - arrays["boundary_y"]) / arrays["state_scale"]
-    residual = jnp.where(arrays["boundary_mask"], residual, 0.0)
-    start_mse = _masked_mse_per_state(residual[0::2], arrays["boundary_mask"][0::2])
-    final_mse = _masked_mse_per_state(residual[1::2], arrays["boundary_mask"][1::2])
-    mse_per_state = 0.5 * (start_mse + final_mse)
-    return jnp.sum(arrays["aux_fit_weights"] * mse_per_state)
+    """Auxiliary condition loss from reliable condition constraints only.
+    """
+
+    boundary_volume_l = jnp.full(
+        (arrays["boundary_x"].shape[0],),
+        PseudomonasBIOSODE.default_parameters["Vl"],
+        dtype=arrays["boundary_x"].dtype,
+    )
+    boundary_pred = _constrained_states(model, arrays["boundary_x"], boundary_volume_l, arrays)
+    initial_pred = boundary_pred[0::2]
+    initial_target = arrays["boundary_y"][0::2]
+    initial_mask = arrays["boundary_mask"][0::2]
+
+    substrate_idx = STATE_INDEX["Substrate"]
+    h_idx = STATE_INDEX["H"]
+    o2_idx = STATE_INDEX["O2_l"]
+
+    glucose_residual = (
+        (initial_pred[:, substrate_idx] - initial_target[:, substrate_idx])
+        / jnp.maximum(arrays["state_scale"][substrate_idx], 1e-12)
+    )
+    glucose_mask = initial_mask[:, substrate_idx]
+    glucose0_loss = _masked_scalar_mse(glucose_residual, glucose_mask)
+
+    initial_volume_l = jnp.asarray(PseudomonasBIOSODE.default_parameters["Vl"], dtype=initial_pred.dtype)
+    pred_ph0 = -jnp.log10(jnp.maximum(initial_pred[:, h_idx] / initial_volume_l, 1e-14))
+    target_ph0 = -jnp.log10(jnp.maximum(initial_target[:, h_idx] / initial_volume_l, 1e-14))
+    ph_residual = pred_ph0 - target_ph0
+    ph_mask = initial_mask[:, h_idx]
+    ph0_loss = _masked_scalar_mse(ph_residual, ph_mask)
+
+    return (
+        arrays["aux_fit_weights"][substrate_idx] * glucose0_loss
+        + arrays["aux_fit_weights"][h_idx] * ph0_loss
+    )
+
+
+def _do_percent_from_o2_l(o2_l_mol: jnp.ndarray, volume_l: jnp.ndarray) -> jnp.ndarray:
+    p = PseudomonasBIOSODE.default_parameters
+    saturation_o2_l_mol = p["FractionO2"] * p["Pr"] * p["HenryConstantO2"] * jnp.maximum(volume_l, 1e-12)
+    return 100.0 * o2_l_mol / jnp.maximum(saturation_o2_l_mol, 1e-12)
 
 
 def _regularization_loss(
@@ -522,8 +995,12 @@ def _raw_ode_residual(
     base_rate_l_min: jnp.ndarray,
 ) -> jnp.ndarray:
     unit_tangent = jnp.zeros_like(xi).at[arrays["time_column_index"]].set(1.0)
-    state = model(xi)
-    dstate_dt_norm = jax.jvp(lambda x_inner: model(x_inner), (xi,), (unit_tangent,))[1]
+    state = _constrained_state(model, xi, volume_l, arrays)
+    dstate_dt_norm = jax.jvp(
+        lambda x_inner: _constrained_state(model, x_inner, volume_l, arrays),
+        (xi,),
+        (unit_tangent,),
+    )[1]
     dstate_dt_phys = dstate_dt_norm / arrays["time_x_std"]
     time_phys = xi[arrays["time_column_index"]] * arrays["time_x_std"] + arrays["time_x_mean"]
     rhs = PseudomonasBIOSODE.ode_func(
@@ -545,6 +1022,11 @@ def _raw_ode_residual(
 def _masked_mse_per_state(residual: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
     denom = jnp.maximum(jnp.sum(mask, axis=0), 1)
     return jnp.sum(jnp.where(mask, residual**2, 0.0), axis=0) / denom
+
+
+def _masked_scalar_mse(residual: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
+    denom = jnp.maximum(jnp.sum(mask), 1)
+    return jnp.sum(jnp.where(mask, residual**2, 0.0)) / denom
 
 
 def _build_ode_params(
@@ -581,6 +1063,9 @@ def _validate_weight_vector(name: str, values: tuple[float, ...], expected_lengt
 
 def _device_arrays(dataset: PseudomonasDataset, config: TrainingConfig | None = None) -> dict[str, jnp.ndarray]:
     time_idx = dataset.input_columns.index("time_min")
+    do_setpoint_idx = dataset.input_columns.index("DO_setpoint")
+    initial_glucose_idx = dataset.input_columns.index("initial_glucose_g_l")
+    initial_ph_idx = dataset.input_columns.index("initial_pH")
     obs_fit_weights = config.obs_fit_weights if config is not None else (1.0,) * dataset.y.shape[1]
     aux_fit_weights = config.aux_fit_weights if config is not None else (1.0,) * len(PseudomonasBIOSODE.state_names)
     res_eq_weights = config.res_eq_weights if config is not None else (1.0,) * len(PseudomonasBIOSODE.state_names)
@@ -590,6 +1075,7 @@ def _device_arrays(dataset: PseudomonasDataset, config: TrainingConfig | None = 
         "y": jnp.asarray(dataset.y, dtype=jnp.float32),
         "y_mask": jnp.asarray(dataset.y_mask),
         "time_min": jnp.asarray(dataset.time_min, dtype=jnp.float32),
+        "do_setpoint": jnp.asarray(dataset.x_raw[:, do_setpoint_idx], dtype=jnp.float32),
         "volume_l": jnp.asarray(dataset.volume_l, dtype=jnp.float32),
         "air_flow_l_min": jnp.asarray(dataset.air_flow_l_min, dtype=jnp.float32),
         "sampling_rate_l_min": jnp.asarray(dataset.sampling_rate_l_min, dtype=jnp.float32),
@@ -605,7 +1091,12 @@ def _device_arrays(dataset: PseudomonasDataset, config: TrainingConfig | None = 
         "aux_fit_weights": jnp.asarray(aux_fit_weights, dtype=jnp.float32),
         "res_eq_weights": jnp.asarray(res_eq_weights, dtype=jnp.float32),
         "reg_eq_weights": jnp.asarray(reg_eq_weights, dtype=jnp.float32),
+        "x_mean": jnp.asarray(dataset.x_mean, dtype=jnp.float32),
+        "x_std": jnp.asarray(dataset.x_std, dtype=jnp.float32),
         "time_column_index": jnp.asarray(time_idx),
+        "initial_glucose_column_index": jnp.asarray(initial_glucose_idx),
+        "initial_ph_column_index": jnp.asarray(initial_ph_idx),
+        "do_setpoint_column_index": jnp.asarray(do_setpoint_idx),
         "time_x_mean": jnp.asarray(dataset.x_mean[time_idx], dtype=jnp.float32),
         "time_x_std": jnp.asarray(dataset.x_std[time_idx], dtype=jnp.float32),
     }
@@ -614,7 +1105,7 @@ def _device_arrays(dataset: PseudomonasDataset, config: TrainingConfig | None = 
 __all__ = [
     "TrainingConfig",
     "predict_dataset",
-    "predict_gas_dataset",
+    "run_leave_one_bioreactor_out",
     "save_checkpoint",
     "save_training_config",
     "train_pinn",

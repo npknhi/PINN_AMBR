@@ -15,6 +15,12 @@ from data.parameters import ode_parameters_dict, ode_parameter_ranges_dict, stat
 
 INPUT_COLUMNS = [
     "time_min",
+    "initial_pH",
+    "DO_setpoint",
+    "initial_glucose_g_l",
+    "AFR_setpoint",
+    "antifoam_absent",
+    "antifoam_present",
 ]
 
 
@@ -25,7 +31,7 @@ STATE_INDEX = {name: index for index, name in enumerate(STATE_NAMES)}
 OBSERVABLE_COLUMNS = {
     "glucose_mol_l": "Substrate",
     "biomass_g_l": "Biomass",
-    "O2_l_mol": "O2_l",
+    "DO_percent": "O2_l",
     "pH": "H",
 }
 
@@ -325,13 +331,18 @@ def observable_predictions(states: jnp.ndarray, volume_l: jnp.ndarray | float | 
     observables.
     """
 
-    predictions = {
-        "O2_l_mol": states[..., STATE_INDEX["O2_l"]],
-    }
+    predictions = {"O2_l_mol": states[..., STATE_INDEX["O2_l"]]}
     if volume_l is not None:
         volume_safe = jnp.maximum(volume_l, 1e-12)
         predictions["glucose_mol_l"] = states[..., STATE_INDEX["Substrate"]] / volume_safe
         predictions["biomass_g_l"] = states[..., STATE_INDEX["Biomass"]] / volume_safe
+        saturation_o2_l_mol = (
+            PseudomonasBIOSODE.default_parameters["FractionO2"]
+            * PseudomonasBIOSODE.default_parameters["Pr"]
+            * PseudomonasBIOSODE.default_parameters["HenryConstantO2"]
+            * volume_safe
+        )
+        predictions["DO_percent"] = 100.0 * states[..., STATE_INDEX["O2_l"]] / jnp.maximum(saturation_o2_l_mol, 1e-12)
         h_mol_l = states[..., STATE_INDEX["H"]] / volume_safe
         predictions["pH"] = -jnp.log10(jnp.maximum(h_mol_l, 1e-14))
     return predictions

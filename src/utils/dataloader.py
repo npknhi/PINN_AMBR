@@ -4,21 +4,22 @@ from __future__ import annotations
 """Data loading helpers for the processed AMBR data."""
 
 import hashlib
+import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.integrate import solve_ivp
 
-from data.parameters import initial_conditions_dict
 from src.models.pinn import INPUT_COLUMNS, OBSERVABLE_COLUMNS, PseudomonasBIOSODE, STATE_INDEX, STATE_NAMES
 
 OBSERVABLE_TARGET_COLUMNS = tuple(OBSERVABLE_COLUMNS.keys())
 GAS_TARGET_COLUMNS = ("OUR_mol_min", "CER_mol_min", "CO2_offgas_fraction", "RQ")
 WATER_ION_PRODUCT = 1e-14
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-AUXILIARY_CACHE_VERSION = "v6_odemodelputida_cardinal_ph"
+AUXILIARY_CACHE_VERSION = "v7_observed_output_boundaries"
+ONE_HOT_INPUT_COLUMNS = ("antifoam_absent", "antifoam_present")
 
 
 @dataclass(frozen=True)
@@ -52,68 +53,201 @@ class PseudomonasDataset:
     output_dir: str | None = None
 
 
-def load_pseudomonas_splits(
+def load_pseudomonas_bioreactor_split(
     processed_csv: str | Path = "data/processed/ambr_preprocessed.csv",
     input_columns: tuple[str, ...] = tuple(INPUT_COLUMNS),
     target_columns: tuple[str, ...] = OBSERVABLE_TARGET_COLUMNS,
-    experiment_id: str | None = None,
-    test_fraction: float = 0.2,
-    split_strategy: str = "random",
-    random_seed: int = 42,
-) -> tuple[PseudomonasDataset, PseudomonasDataset]:
-    """Load train/test datasets for each selected experiment.
+    train_experiment_ids: Sequence[str] = (),
+    test_experiment_ids: Sequence[str] = (),
+    validation_experiment_ids: Sequence[str] = (),
+) -> tuple[PseudomonasDataset, PseudomonasDataset | None, PseudomonasDataset, dict[str, object]]:
+    """Load an explicit benchmark split by bioreactor id."""
 
-    The normalization statistics are fitted on the full selected trajectory so
-    train and test rows share the same 0-1 time scaling. The default random
-    split is stratified by glucose availability so train keeps glucose rows.
+    train_ids = tuple(str(experiment_id) for experiment_id in train_experiment_ids)
+    test_ids = tuple(str(experiment_id) for experiment_id in test_experiment_ids)
+    val_ids = tuple(str(experiment_id) for experiment_id in validation_experiment_ids)
+    if not train_ids:
+        raise ValueError("train_experiment_ids must not be empty.")
+    if not test_ids:
+        raise ValueError("test_experiment_ids must not be empty.")
+    overlap = sorted((set(train_ids) & set(test_ids)) | (set(train_ids) & set(val_ids)) | (set(val_ids) & set(test_ids)))
+    if overlap:
+        raise ValueError(f"Train, validation, and test bioreactors must be disjoint: {overlap}")
+
+    frame = _ensure_columns(_load_processed_frame(processed_csv), input_columns, target_columns)
+    _validate_experiment_ids(frame, (*train_ids, *val_ids, *test_ids))
+    train_dataset, val_dataset, test_dataset = _build_bioreactor_datasets(
+        frame,
+        input_columns,
+        target_columns,
+        train_ids,
+        test_ids,
+        val_ids,
+    )
+    metadata: dict[str, object] = {
+        "split_strategy": "bioreactor_id",
+        "train_experiment_ids": list(train_ids),
+        "validation_experiment_ids": list(val_ids),
+        "test_experiment_ids": list(test_ids),
+        "all_experiment_ids": [*train_ids, *val_ids, *test_ids],
+    }
+    return train_dataset, val_dataset, test_dataset, metadata
+
+
+def load_pseudomonas_leave_one_bioreactor_out_split(
+    processed_csv: str | Path = "data/processed/ambr_preprocessed.csv",
+    input_columns: tuple[str, ...] = tuple(INPUT_COLUMNS),
+    target_columns: tuple[str, ...] = OBSERVABLE_TARGET_COLUMNS,
+    experiment_ids: Sequence[str] | None = None,
+    fold_index: int = 0,
+    validation_strategy: str = "rotate",
+    validation_seed: int | None = None,
+) -> tuple[PseudomonasDataset, PseudomonasDataset, PseudomonasDataset, dict[str, object]]:
+    """Load one leave-one-bioreactor-out benchmark fold.
+
+    Splits are made exclusively by ``Experiment_id`` so no time points from a
+    held-out bioreactor leak into training. Normalization and scaling
+    statistics are fitted on the training bioreactors only.
     """
 
-    if not 0.0 < test_fraction < 1.0:
-        raise ValueError("test_fraction must be between 0 and 1.")
-    if split_strategy not in {"random", "time"}:
-        raise ValueError("split_strategy must be either 'random' or 'time'.")
+    frame = _ensure_columns(_load_processed_frame(processed_csv), input_columns, target_columns)
+    frame = _filter_experiment_ids(frame, experiment_ids)
+    folds = make_leave_one_bioreactor_out_folds(frame)
+    if not 0 <= fold_index < len(folds):
+        raise ValueError(f"fold_index must be in [0, {len(folds) - 1}].")
 
-    frame = _ensure_columns(_load_processed_frame(processed_csv, experiment_id), input_columns, target_columns)
-    if split_strategy == "time":
-        train_mask, test_mask = _time_split_mask(frame, target_columns, test_fraction)
+    test_ids = tuple(folds[fold_index])
+    if validation_strategy == "rotate":
+        val_fold_index = (fold_index + 1) % len(folds)
+    elif validation_strategy == "random":
+        candidate_indices = [index for index in range(len(folds)) if index != fold_index]
+        rng_seed = int(validation_seed) if validation_seed is not None else 0
+        rng = np.random.default_rng(rng_seed + int(fold_index))
+        val_fold_index = int(rng.choice(candidate_indices))
     else:
-        train_mask, test_mask = _random_stratified_split_mask(frame, test_fraction, random_seed)
-    train_frame = frame.loc[train_mask].reset_index(drop=True)
-    test_frame = frame.loc[test_mask].reset_index(drop=True)
+        raise ValueError("validation_strategy must be 'rotate' or 'random'.")
+    val_ids = tuple(folds[val_fold_index])
+    train_ids = tuple(
+        experiment_id
+        for current_index, fold in enumerate(folds)
+        if current_index not in {fold_index, val_fold_index}
+        for experiment_id in fold
+    )
+    train_dataset, val_dataset, test_dataset = _build_bioreactor_datasets(
+        frame,
+        input_columns,
+        target_columns,
+        train_ids,
+        test_ids,
+        val_ids,
+    )
+    metadata: dict[str, object] = {
+        "split_strategy": "leave_one_bioreactor_out",
+        "validation_strategy": validation_strategy,
+        "validation_seed": None if validation_seed is None else int(validation_seed),
+        "n_splits": len(folds),
+        "fold_index": int(fold_index),
+        "train_experiment_ids": list(train_ids),
+        "validation_experiment_ids": list(val_ids),
+        "test_experiment_ids": list(test_ids),
+        "all_experiment_ids": [experiment_id for fold in folds for experiment_id in fold],
+    }
+    return train_dataset, val_dataset, test_dataset, metadata
+
+
+def make_leave_one_bioreactor_out_folds(
+    frame: pd.DataFrame,
+) -> list[tuple[str, ...]]:
+    """Create one deterministic fold per unique bioreactor id."""
+
+    experiment_ids = _unique_experiment_ids(frame)
+    if len(experiment_ids) < 2:
+        raise ValueError("Leave-one-bioreactor-out requires at least 2 selected bioreactors.")
+    return [(experiment_id,) for experiment_id in experiment_ids]
+
+
+def _build_bioreactor_datasets(
+    frame: pd.DataFrame,
+    input_columns: tuple[str, ...],
+    target_columns: tuple[str, ...],
+    train_ids: Sequence[str],
+    test_ids: Sequence[str],
+    val_ids: Sequence[str] = (),
+) -> tuple[PseudomonasDataset, PseudomonasDataset | None, PseudomonasDataset]:
+    train_frame = frame[frame["Experiment_id"].astype(str).isin(train_ids)].reset_index(drop=True)
+    val_frame = frame[frame["Experiment_id"].astype(str).isin(val_ids)].reset_index(drop=True)
+    test_frame = frame[frame["Experiment_id"].astype(str).isin(test_ids)].reset_index(drop=True)
     if train_frame.empty or test_frame.empty:
-        raise ValueError("Train/test split produced an empty dataset.")
+        raise ValueError("Bioreactor split produced an empty dataset.")
 
     train_dataset = _build_dataset(
         train_frame,
         input_columns,
         target_columns,
-        scaler_frame=frame,
-        boundary_frame=frame,
+        scaler_frame=train_frame,
+        boundary_frame=train_frame,
     )
+    val_dataset = None
+    if val_ids:
+        if val_frame.empty:
+            raise ValueError("Validation split produced an empty dataset.")
+        val_dataset = _build_dataset(
+            val_frame,
+            input_columns,
+            target_columns,
+            scalers=train_dataset,
+            boundary_frame=val_frame,
+        )
     test_dataset = _build_dataset(
         test_frame,
         input_columns,
         target_columns,
         scalers=train_dataset,
-        boundary_frame=frame,
+        boundary_frame=test_frame,
     )
-    return train_dataset, test_dataset
+    return train_dataset, val_dataset, test_dataset
 
 
-def _load_processed_frame(
-    processed_csv: str | Path,
-    experiment_id: str | None = None,
-) -> pd.DataFrame:
+def _load_processed_frame(processed_csv: str | Path) -> pd.DataFrame:
     frame = pd.read_csv(processed_csv, low_memory=False)
     if "Experiment_id" not in frame.columns:
         raise ValueError("Processed data must contain an Experiment_id column.")
-    if experiment_id is not None:
-        frame = frame[frame["Experiment_id"].astype(str) == experiment_id].copy()
-        if frame.empty:
-            raise ValueError(f"No rows found for Experiment_id={experiment_id!r}.")
 
     frame = frame.sort_values(["Experiment_id", "time_min"]).reset_index(drop=True)
     return frame
+
+
+def _filter_experiment_ids(
+    frame: pd.DataFrame,
+    experiment_ids: Sequence[str] | None,
+) -> pd.DataFrame:
+    if experiment_ids is None:
+        return frame
+    selected = tuple(str(experiment_id) for experiment_id in experiment_ids)
+    if not selected:
+        raise ValueError("experiment_ids must not be empty.")
+    _validate_experiment_ids(frame, selected)
+    return frame[frame["Experiment_id"].astype(str).isin(selected)].reset_index(drop=True)
+
+
+def _validate_experiment_ids(frame: pd.DataFrame, experiment_ids: Sequence[str]) -> None:
+    available = set(frame["Experiment_id"].astype(str).unique())
+    missing = sorted(set(experiment_ids) - available)
+    if missing:
+        raise ValueError(f"Unknown Experiment_id values: {missing}")
+
+
+def _unique_experiment_ids(frame: pd.DataFrame) -> list[str]:
+    values = frame["Experiment_id"].dropna().astype(str).drop_duplicates().tolist()
+    return sorted(values, key=_experiment_id_sort_key)
+
+
+def _experiment_id_sort_key(experiment_id: object) -> tuple[int, int, str]:
+    text = str(experiment_id)
+    match = re.match(r"^AMBR(\d+)_(\d+)$", text)
+    if match:
+        return int(match.group(1)), int(match.group(2)), text
+    return 10**9, 10**9, text
 
 
 def _build_dataset(
@@ -145,6 +279,11 @@ def _build_dataset(
         x_std = scalers.x_std
         target_scale = scalers.target_scale
     x_std = np.where(x_std < 1e-8, 1.0, x_std).astype(np.float32)
+    for column in ONE_HOT_INPUT_COLUMNS:
+        if column in input_columns:
+            index = input_columns.index(column)
+            x_mean[index] = 0.0
+            x_std[index] = 1.0
     x = ((x_raw - x_mean) / x_std).astype(np.float32)
 
     targets = frame.loc[:, target_columns].apply(pd.to_numeric, errors="coerce")
@@ -200,70 +339,6 @@ def _build_dataset(
     )
 
 
-def _time_split_mask(
-    frame: pd.DataFrame,
-    target_columns: tuple[str, ...],
-    test_fraction: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    train_mask = np.zeros(len(frame), dtype=bool)
-    test_mask = np.zeros(len(frame), dtype=bool)
-    for _, group in frame.groupby("Experiment_id", sort=False):
-        observed = group[group.loc[:, target_columns].notna().any(axis=1)].sort_values("time_min")
-        if len(observed) < 2:
-            raise ValueError(f"Experiment {group['Experiment_id'].iloc[0]} needs at least two observed rows.")
-        n_test = min(max(1, int(np.ceil(len(observed) * test_fraction))), len(observed) - 1)
-        cutoff = float(observed.iloc[-n_test]["time_min"])
-        train_indices = group[group["time_min"] < cutoff].index.to_numpy()
-        test_indices = group[group["time_min"] >= cutoff].index.to_numpy()
-        if len(train_indices) == 0 or len(test_indices) == 0:
-            raise ValueError(f"Experiment {group['Experiment_id'].iloc[0]} produced an empty split.")
-        train_mask[train_indices] = True
-        test_mask[test_indices] = True
-    return train_mask, test_mask
-
-
-def _random_stratified_split_mask(
-    frame: pd.DataFrame,
-    test_fraction: float,
-    random_seed: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    train_mask = np.zeros(len(frame), dtype=bool)
-    test_mask = np.zeros(len(frame), dtype=bool)
-    rng = np.random.default_rng(random_seed)
-
-    for _, group in frame.groupby("Experiment_id", sort=False):
-        if len(group) < 2:
-            raise ValueError(f"Experiment {group['Experiment_id'].iloc[0]} needs at least two rows.")
-
-        has_glucose = _numeric(group["glucose_mol_l"]).notna()
-        for glucose_present in (True, False):
-            stratum_indices = group.loc[has_glucose == glucose_present].index.to_numpy()
-            if len(stratum_indices) == 0:
-                continue
-            if len(stratum_indices) == 1:
-                train_mask[stratum_indices] = True
-                continue
-
-            shuffled = rng.permutation(stratum_indices)
-            n_test = min(max(1, int(np.ceil(len(shuffled) * test_fraction))), len(shuffled) - 1)
-            test_mask[shuffled[:n_test]] = True
-            train_mask[shuffled[n_test:]] = True
-
-        group_indices = group.index.to_numpy()
-        if not test_mask[group_indices].any():
-            train_indices = group_indices[train_mask[group_indices]]
-            fallback_candidates = train_indices[_numeric(frame.loc[train_indices, "glucose_mol_l"]).isna().to_numpy()]
-            if len(fallback_candidates) == 0:
-                fallback_candidates = train_indices
-            test_index = rng.choice(fallback_candidates)
-            train_mask[test_index] = False
-            test_mask[test_index] = True
-        if not train_mask[group_indices].any():
-            raise ValueError(f"Experiment {group['Experiment_id'].iloc[0]} produced an empty train split.")
-
-    return train_mask, test_mask
-
-
 def _ensure_columns(
     frame: pd.DataFrame,
     input_columns: tuple[str, ...],
@@ -301,12 +376,8 @@ def _build_boundary_conditions(
     for _, group in frame.sort_values(["Experiment_id", "time_min"]).groupby("Experiment_id", sort=False):
         first_row = group.iloc[[0]]
         final_row = group.iloc[[-1]]
-        initial_state = _initial_state_from_rows(first_row)[0]
-        initial_mask = np.isfinite(initial_state) & (initial_state >= 0.0)
-
-        final_state = _solve_final_state(group, initial_state)
-        final_mask = np.isfinite(final_state) & (final_state >= 0.0)
-        final_state, final_mask = _overwrite_final_observed_states(group, final_state, final_mask)
+        initial_state, initial_mask = _observed_boundary_state(first_row.iloc[0], use_initial_metadata=True)
+        final_state, final_mask = _observed_boundary_state(final_row.iloc[0], use_initial_metadata=False)
 
         boundary_frames.extend([first_row, final_row])
         boundary_states.extend([initial_state, final_state])
@@ -361,122 +432,38 @@ def _auxiliary_cache_path(frame: pd.DataFrame, input_columns: tuple[str, ...]) -
     return PROJECT_ROOT / "data" / "processed" / "auxiliary_cache" / f"boundaries_{digest}.npz"
 
 
-def _initial_state_from_rows(first_rows: pd.DataFrame) -> np.ndarray:
-    p = PseudomonasBIOSODE.default_parameters
-    initial_y = np.zeros((len(first_rows), len(STATE_NAMES)), dtype=np.float32)
-    initial_volume = _numeric(first_rows["initial_volume_l"])
-    initial_glucose = _numeric(first_rows["initial_glucose_mol_l"])
-    initial_biomass = _numeric(first_rows["initial_biomass_g_l"])
-    initial_ph = _numeric(first_rows["initial_pH"])
-    for state_name, value in initial_conditions_dict.items():
-        if state_name in STATE_INDEX:
-            initial_y[:, STATE_INDEX[state_name]] = float(value)
+def _observed_boundary_state(row: pd.Series, *, use_initial_metadata: bool) -> tuple[np.ndarray, np.ndarray]:
+    state = np.zeros((len(STATE_NAMES),), dtype=np.float32)
+    mask = np.zeros((len(STATE_NAMES),), dtype=bool)
+    volume = _finite_or_default(
+        row.get("initial_volume_l" if use_initial_metadata else "volume_l"),
+        PseudomonasBIOSODE.default_parameters["Vl"],
+    )
+    glucose = _finite_or_none(row.get("initial_glucose_mol_l" if use_initial_metadata else "glucose_mol_l"))
+    biomass = _finite_or_none(row.get("initial_biomass_g_l" if use_initial_metadata else "biomass_g_l"))
+    oxygen = _finite_or_none(row.get("O2_l_mol"))
+    ph = _finite_or_none(row.get("initial_pH" if use_initial_metadata else "pH"))
 
-    initial_y[:, STATE_INDEX["Substrate"]] = (initial_glucose * initial_volume).to_numpy(dtype=np.float32)
-    initial_y[:, STATE_INDEX["Biomass"]] = (initial_biomass * initial_volume).to_numpy(dtype=np.float32)
-
-    gas_volume = (p["Vtotal"] - initial_volume).clip(lower=1e-9)
-    total_moles_gas = p["Pr"] * (gas_volume / 1000.0) / (p["R"] * p["TKelvin"])
-    initial_y[:, STATE_INDEX["CO2_l"]] = (p["CSatCO2"] * initial_volume).to_numpy(dtype=np.float32)
-    initial_y[:, STATE_INDEX["O2_l"]] = (p["CSatO2"] * initial_volume).to_numpy(dtype=np.float32)
-    initial_y[:, STATE_INDEX["CO2_g"]] = (
-        p["FractionCO2"] * total_moles_gas
-    ).to_numpy(dtype=np.float32)
-    initial_y[:, STATE_INDEX["O2_g"]] = (
-        p["FractionO2"] * total_moles_gas
-    ).to_numpy(dtype=np.float32)
-
-    h_conc = 10.0 ** (-initial_ph)
-    oh_conc = WATER_ION_PRODUCT / h_conc
-    initial_y[:, STATE_INDEX["H"]] = (h_conc * initial_volume).to_numpy(dtype=np.float32)
-    initial_y[:, STATE_INDEX["OH"]] = (oh_conc * initial_volume).to_numpy(dtype=np.float32)
-    return initial_y
-
-
-def _solve_final_state(group: pd.DataFrame, initial_state: np.ndarray) -> np.ndarray:
-    rows = group.sort_values("time_min").reset_index(drop=True)
-    y = np.asarray(initial_state, dtype=np.float64)
-    times = _numeric(rows["time_min"]).to_numpy(dtype=np.float64)
-    for index in range(len(rows) - 1):
-        t0 = float(times[index])
-        t1 = float(times[index + 1])
-        if not np.isfinite(t0) or not np.isfinite(t1) or t1 <= t0:
-            continue
-        controls = _ode_controls_from_row(rows.iloc[index])
-
-        params = {**PseudomonasBIOSODE.default_parameters, **controls}
-
-        def rhs(t: float, state: np.ndarray) -> np.ndarray:
-            return PseudomonasBIOSODE.ode_func_numpy(t, state, params)
-
-        solution = solve_ivp(
-            rhs,
-            (t0, t1),
-            y,
-            method="BDF",
-            rtol=1e-5,
-            atol=1e-10,
-        )
-        if solution.success:
-            y = solution.y[:, -1]
-        else:
-            y = y + (t1 - t0) * rhs(t0, y)
-        y = np.where(np.isfinite(y), y, np.nan)
-        y = np.maximum(y, 0.0)
-    return y.astype(np.float32)
-
-
-def _ode_controls_from_row(row: pd.Series) -> dict[str, float]:
-    volume_l = _finite_or_default(row.get("volume_l"), PseudomonasBIOSODE.default_parameters["Vl"])
-    air_flow_l_min = _finite_or_default(row.get("air_flow_l_min"), PseudomonasBIOSODE.default_parameters["Vg"])
-    sampling_rate_l_min = _finite_or_default(row.get("sampling_rate_l_min"), 0.0)
-    acid_rate_l_min = _finite_or_default(row.get("acid_rate_l_min"), 0.0)
-    base_rate_l_min = _finite_or_default(row.get("base_rate_l_min"), 0.0)
-    return {
-        "Vl": volume_l,
-        "Vg": air_flow_l_min,
-        "VOffGas": air_flow_l_min,
-        "Vs": sampling_rate_l_min,
-        "Va": acid_rate_l_min,
-        "Vb": base_rate_l_min,
+    values = {
+        "Substrate": glucose * volume if glucose is not None else None,
+        "Biomass": biomass * volume if biomass is not None else None,
+        "O2_l": oxygen,
+        "H": (10.0 ** (-ph)) * volume if ph is not None else None,
     }
-
-
-def _overwrite_final_observed_states(
-    group: pd.DataFrame,
-    final_state: np.ndarray,
-    final_mask: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    volume = _finite_or_default(group.iloc[-1].get("volume_l"), PseudomonasBIOSODE.default_parameters["Vl"])
-    replacements = {
-        "Substrate": _last_finite(group, "glucose_mol_l", multiply_by=volume),
-        "Biomass": _last_finite(group, "biomass_g_l", multiply_by=volume),
-        "O2_l": _last_finite(group, "O2_l_mol"),
-        "H": _last_ph_as_h_amount(group, volume),
-    }
-    for state_name, value in replacements.items():
-        idx = STATE_INDEX[state_name]
+    for state_name, value in values.items():
         if value is not None and np.isfinite(value) and value >= 0.0:
-            final_state[idx] = value
-            final_mask[idx] = True
-    return final_state, final_mask
+            idx = STATE_INDEX[state_name]
+            state[idx] = np.float32(value)
+            mask[idx] = True
+    return state, mask
 
 
-def _last_finite(group: pd.DataFrame, column: str, multiply_by: float | None = None) -> float | None:
-    if column not in group.columns:
+def _finite_or_none(value: object) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
         return None
-    values = _numeric(group[column]).replace([np.inf, -np.inf], np.nan).dropna()
-    if values.empty:
-        return None
-    value = float(values.iloc[-1])
-    return value * multiply_by if multiply_by is not None else value
-
-
-def _last_ph_as_h_amount(group: pd.DataFrame, volume_l: float) -> float | None:
-    ph = _last_finite(group, "pH")
-    if ph is None:
-        return None
-    return (10.0 ** (-ph)) * volume_l
+    return result if np.isfinite(result) else None
 
 
 def _finite_or_default(value: object, default: float) -> float:
@@ -488,10 +475,12 @@ def _finite_or_default(value: object, default: float) -> float:
 
 
 def _scale_from_boundary(boundary_y: np.ndarray, boundary_mask: np.ndarray) -> np.ndarray:
-    masked = np.where(boundary_mask, np.abs(boundary_y), np.nan)
-    scales = np.nanmax(masked, axis=0)
-    scales = np.where(np.isfinite(scales), scales, 1.0)
-    return np.maximum(scales, 1e-12).astype(np.float32)
+    scales = np.ones((boundary_y.shape[1],), dtype=np.float32)
+    for idx in range(boundary_y.shape[1]):
+        values = np.abs(boundary_y[boundary_mask[:, idx], idx])
+        if values.size:
+            scales[idx] = max(float(np.nanmax(values)), 1e-12)
+    return scales
 
 
 def _scale_from_targets(y: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -511,5 +500,7 @@ __all__ = [
     "OBSERVABLE_TARGET_COLUMNS",
     "GAS_TARGET_COLUMNS",
     "PseudomonasDataset",
-    "load_pseudomonas_splits",
+    "load_pseudomonas_bioreactor_split",
+    "load_pseudomonas_leave_one_bioreactor_out_split",
+    "make_leave_one_bioreactor_out_folds",
 ]
