@@ -1,4 +1,4 @@
-#src/utils/training_v1.py
+#src/utils/training_v2.py
 from __future__ import annotations
 
 """Training utilities for the AMBR Pseudomonas PINN flow with pH range loss."""
@@ -17,7 +17,7 @@ import jinns
 import numpy as np
 import optax
 
-from src.models.pinn_v1 import (
+from src.models.pinn import (
     INPUT_COLUMNS,
     OBSERVABLE_COLUMNS,
     PseudomonasBIOSODE,
@@ -25,7 +25,7 @@ from src.models.pinn_v1 import (
     cardinal_pH,
     create_equinox_network,
 )
-from src.utils.dataloader_v1 import (
+from src.utils.dataloader import (
     PseudomonasDataset,
     load_pseudomonas_bioreactor_split,
     load_pseudomonas_leave_one_bioreactor_out_split,
@@ -377,13 +377,12 @@ def run_leave_one_bioreactor_out(
     """Run leave-one-bioreactor-out benchmarking for PINN.
 
     Each fold holds out one complete bioreactor, repeated across random seeds,
-    with metrics saved as long-form and mean/std summary CSV files.
+    with per-split metrics and runtime saved as CSV files.
     """
 
     import pandas as pd
 
-    from src.utils.evaluation_v1 import (
-        OBSERVABLE_TABLE_LABELS,
+    from src.utils.evaluation import (
         evaluate_observables,
         save_reports,
     )
@@ -397,7 +396,6 @@ def run_leave_one_bioreactor_out(
     output_dir.mkdir(parents=True, exist_ok=True)
     metrics_long_path = output_dir / "leave_one_out_metrics_long.csv"
     runtime_path = output_dir / "leave_one_out_runtime.csv"
-    table_path = output_dir / "leave_one_out_table.csv"
     fold_frame = _selected_experiment_frame(base_config.processed_csv, base_config.experiment_ids)
     folds = make_leave_one_bioreactor_out_folds(fold_frame)
     all_experiment_ids = [experiment_id for fold in folds for experiment_id in fold]
@@ -466,22 +464,14 @@ def run_leave_one_bioreactor_out(
         runtime = pd.read_csv(runtime_path)
     else:
         runtime = pd.DataFrame(runtime_rows)
-    table = _v1_metric_table(
-        metrics_long,
-        benchmark="Leave-One-Bioreactor-Out",
-        observable_labels=OBSERVABLE_TABLE_LABELS,
-    )
-    table.to_csv(table_path, index=False)
 
     return {
         "output_dir": str(output_dir),
         "metrics_long": metrics_long,
         "runtime": runtime,
-        "table": table,
         "paths": {
             "metrics_long": metrics_long_path,
             "runtime": runtime_path,
-            "table": table_path,
         },
         "results": kept_results,
     }
@@ -898,16 +888,22 @@ def _apply_hard_initial_constraints(
     p = PseudomonasBIOSODE.default_parameters
     saturation_o2_l_mol = p["FractionO2"] * p["Pr"] * p["HenryConstantO2"] * volume
     do_lower_o2_l = (do_lower_percent / 100.0) * saturation_o2_l_mol
-    do_smooth_scale = jnp.maximum(0.01 * saturation_o2_l_mol, 1e-12)
+    do_upper_percent = jnp.maximum(arrays["do_upper_percent"], do_lower_percent)
+    do_upper_o2_l = (do_upper_percent / 100.0) * saturation_o2_l_mol
 
     substrate_idx = STATE_INDEX["Substrate"]
     h_idx = STATE_INDEX["H"]
     o2_idx = STATE_INDEX["O2_l"]
     substrate = jnp.where(is_initial_time, initial_substrate, states[:, substrate_idx])
+    substrate = jnp.clip(substrate, 0.0, jnp.maximum(initial_substrate, 0.0))
     h = jnp.where(is_initial_time, initial_h, states[:, h_idx])
-    o2_l = do_lower_o2_l + do_smooth_scale * jax.nn.softplus((states[:, o2_idx] - do_lower_o2_l) / do_smooth_scale)
-    states = states.at[:, substrate_idx].set(jnp.maximum(substrate, 0.0))
-    states = states.at[:, h_idx].set(jnp.maximum(h, 1e-14 * volume))
+    raw_ph = -jnp.log10(jnp.maximum(jnp.maximum(h, 1e-14 * volume) / volume, 1e-14))
+    ph_margin = arrays["pH_range_margin"]
+    constrained_ph = jnp.clip(raw_ph, initial_ph - ph_margin, initial_ph + ph_margin)
+    h = (10.0 ** (-constrained_ph)) * volume
+    o2_l = jnp.clip(states[:, o2_idx], do_lower_o2_l, do_upper_o2_l)
+    states = states.at[:, substrate_idx].set(substrate)
+    states = states.at[:, h_idx].set(h)
     states = states.at[:, o2_idx].set(o2_l)
     return states
 
@@ -1196,6 +1192,11 @@ def _device_arrays(dataset: PseudomonasDataset, config: TrainingConfig | None = 
         "initial_glucose_column_index": jnp.asarray(initial_glucose_idx),
         "initial_ph_column_index": jnp.asarray(initial_ph_idx),
         "do_setpoint_column_index": jnp.asarray(do_setpoint_idx),
+        "pH_range_margin": jnp.asarray(0.1 if config is None else config.pH_range_margin, dtype=jnp.float32),
+        "do_upper_percent": jnp.asarray(
+            105.0 if config is None or config.exclude_do_above_percent is None else config.exclude_do_above_percent,
+            dtype=jnp.float32,
+        ),
         "time_x_mean": jnp.asarray(dataset.x_mean[time_idx], dtype=jnp.float32),
         "time_x_std": jnp.asarray(dataset.x_std[time_idx], dtype=jnp.float32),
     }

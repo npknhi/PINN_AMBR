@@ -27,7 +27,6 @@ AMBR_RENAME_MAP = {
     "Acid volume pumped": "acid_volume_pumped_ml",
     "Air flow": "air_flow_ml_min",
     "Base volume pumped": "base_volume_pumped_ml",
-    "Bioreactor pressure reading": "pressure",
     "CER": "CER_mmol_h",
     "DO": "DO_percent",
     "Off-gas CO2%": "CO2_offgas_percent",
@@ -41,6 +40,7 @@ AMBR_RENAME_MAP = {
 
 OFFLINE_RENAME_MAP = {
     "Reactor": "reactor_label",
+    "Time": "offline_time_h",
     "Sampling events": "offline_sampling_events",
     "Sample volume (ml)": "sample_volume_ml",
     "Glucose": "glucose_g_l",
@@ -49,6 +49,15 @@ OFFLINE_RENAME_MAP = {
 
 FINAL_TRAINING_COLUMNS = [
     "Experiment_id",
+    "condition_label",
+    "initial_pH",
+    "DO_setpoint",
+    "initial_glucose_g_l",
+    "AFR_setpoint",
+    "antifoam_used",
+    "antifoam_absent",
+    "antifoam_present",
+    "initial_od",
     "time_h",
     "time_min",
     "volume_l",
@@ -58,10 +67,11 @@ FINAL_TRAINING_COLUMNS = [
     "base_rate_l_min",
     "initial_biomass_g_l",
     "initial_glucose_mol_l",
-    "initial_pH",
     "initial_volume_l",
+    "glucose_g_l",
     "glucose_mol_l",
     "biomass_g_l",
+    "DO_percent",
     "O2_l_mol",
     "pH",
     "OUR_mol_min",
@@ -72,32 +82,39 @@ FINAL_TRAINING_COLUMNS = [
 
 REQUIRED_MEASURED_TARGET_COLUMNS = [
     "biomass_g_l",
-    "O2_l_mol",
+    "DO_percent",
+    "pH",
+]
+
+TRAINING_OBSERVABLE_COLUMNS = [
+    "glucose_g_l",
+    "biomass_g_l",
+    "DO_percent",
     "pH",
 ]
 
 DEFAULT_PREPROCESSED_CSV = DEFAULT_OUTPUT_DIR / "ambr_preprocessed.csv"
 
-REAL_DATA_PLOT_COLUMNS = ("glucose_mol_l", "biomass_g_l", "O2_l_mol", "pH")
+REAL_DATA_PLOT_COLUMNS = ("glucose_g_l", "biomass_g_l", "DO_percent", "pH")
 
 REAL_DATA_PLOT_TITLES = {
-    "glucose_mol_l": "Glucose",
+    "glucose_g_l": "Glucose",
     "biomass_g_l": "Biomass",
-    "O2_l_mol": "Dissolved O2",
+    "DO_percent": "Dissolved O2",
     "pH": "pH",
 }
 
 REAL_DATA_PLOT_YLABELS = {
-    "glucose_mol_l": "mol/L",
+    "glucose_g_l": "g/L",
     "biomass_g_l": "g/L",
-    "O2_l_mol": "mol",
+    "DO_percent": "%",
     "pH": "pH",
 }
 
 REAL_DATA_PLOT_COLORS = {
-    "glucose_mol_l": "tab:blue",
+    "glucose_g_l": "tab:blue",
     "biomass_g_l": "tab:green",
-    "O2_l_mol": "tab:pink",
+    "DO_percent": "tab:pink",
     "pH": "tab:orange",
 }
 
@@ -157,18 +174,50 @@ def load_metadata(raw_dir: Path) -> pd.DataFrame:
     metadata["initial_pH"] = pd.to_numeric(metadata["InitialPH"], errors="coerce")
     metadata["initial_volume_l"] = _extract_first_number(metadata["LiquidVolume"]) / 1000.0
     metadata["temperature_setpoint_c"] = _extract_first_number(metadata["Temperature"])
+    metadata["antifoam_used"] = metadata["Experiment_id"].astype(str).str.startswith("AMBR2_").astype(int)
+    metadata["antifoam_absent"] = 1 - metadata["antifoam_used"]
+    metadata["antifoam_present"] = metadata["antifoam_used"]
+    condition_mapping = load_condition_mapping(raw_dir)
+    metadata = metadata.merge(condition_mapping, on="Experiment_id", how="left")
+    metadata = standardize_condition_labels(metadata)
 
     keep = [
         "Experiment_id",
+        "condition_label",
+        "initial_pH",
+        "DO_setpoint",
+        "initial_glucose_g_l",
+        "AFR_setpoint",
+        "antifoam_used",
+        "antifoam_absent",
+        "antifoam_present",
         "initial_od",
         "initial_biomass_g_l",
-        "initial_glucose_g_l",
         "initial_glucose_mol_l",
-        "initial_pH",
         "initial_volume_l",
         "temperature_setpoint_c",
     ]
     return metadata[keep]
+
+
+def load_condition_mapping(raw_dir: Path) -> pd.DataFrame:
+    """Load raw condition labels when mapping files are available."""
+
+    mapping_dir = raw_dir / "Model_pseudomonas_putida_120326"
+    frames = []
+    for prefix in ("AMBR1", "AMBR2"):
+        path = mapping_dir / f"MappingData_DissolvedOxygen{prefix}.csv"
+        if not path.exists():
+            continue
+        mapping = pd.read_csv(path, sep=";")
+        mapping = mapping.rename(columns=lambda column: str(column).strip())
+        mapping["Experiment_id"] = mapping["Reactor"].map(lambda value: _experiment_id_from_reactor_label(prefix, value))
+        mapping["raw_condition_label"] = mapping["Label"].map(lambda value: str(value).strip() if pd.notna(value) else "")
+        mapping["raw_condition_label"] = mapping["raw_condition_label"].replace("", pd.NA)
+        frames.append(mapping[["Experiment_id", "raw_condition_label"]])
+    if not frames:
+        return pd.DataFrame(columns=["Experiment_id", "raw_condition_label"])
+    return pd.concat(frames, ignore_index=True).drop_duplicates(subset=["Experiment_id"], keep="first")
 
 
 def load_offline_metabolites(raw_dir: Path) -> pd.DataFrame:
@@ -184,11 +233,12 @@ def load_offline_metabolites(raw_dir: Path) -> pd.DataFrame:
         lambda row: _experiment_id_from_reactor_label(row.get("experiment_prefix"), row.get("reactor_label")),
         axis=1,
     )
-    offline = offline[["Experiment_id", "offline_sampling_events", "sample_volume_ml", "glucose_g_l"]].copy()
+    offline = offline[["Experiment_id", "offline_time_h", "offline_sampling_events", "sample_volume_ml", "glucose_g_l"]].copy()
+    offline["offline_time_h"] = pd.to_numeric(offline["offline_time_h"], errors="coerce")
     offline["sample_volume_ml"] = pd.to_numeric(offline["sample_volume_ml"], errors="coerce")
     offline["glucose_g_l"] = pd.to_numeric(offline["glucose_g_l"], errors="coerce")
     offline["glucose_mol_l"] = offline["glucose_g_l"] / GLUCOSE_MOLAR_MASS_G_MOL
-    return offline.drop(columns=["glucose_g_l"])
+    return offline
 
 
 def add_unit_conversions(frame: pd.DataFrame) -> pd.DataFrame:
@@ -200,12 +250,9 @@ def add_unit_conversions(frame: pd.DataFrame) -> pd.DataFrame:
     converted["OUR_mol_min"] = converted["OUR_mmol_h"] * 1e-3 / 60.0
     converted["CER_mol_min"] = converted["CER_mmol_h"] * 1e-3 / 60.0
     converted["CO2_offgas_fraction"] = converted["CO2_offgas_percent"] / 100.0
-    pressure_reading_mbar = pd.to_numeric(converted["pressure"], errors="coerce")
-    pressure_pa = STANDARD_PRESSURE_PA + pressure_reading_mbar * 100.0
-    pressure_pa = pressure_pa.where(pressure_pa > 0.0, STANDARD_PRESSURE_PA)
     do_fraction = pd.to_numeric(converted["DO_percent"], errors="coerce").clip(lower=0.0) / 100.0
     converted["O2_l_mol"] = (
-        do_fraction * FRACTION_O2_AIR * pressure_pa * HENRY_CONSTANT_O2_MOL_L_PA * converted["volume_l"]
+        do_fraction * FRACTION_O2_AIR * STANDARD_PRESSURE_PA * HENRY_CONSTANT_O2_MOL_L_PA * converted["volume_l"]
     )
     return converted
 
@@ -233,7 +280,32 @@ def merge_offline_by_sampling_event(
         how="left",
         suffixes=("", "_offline"),
     )
-    return merged.drop(columns=["sampling_event_key"])
+    glucose_mask = merged["glucose_g_l"].notna() & merged["offline_time_h"].notna()
+    if not glucose_mask.any():
+        return merged.drop(columns=["sampling_event_key"])
+
+    online_rows = merged.copy()
+    online_rows.loc[glucose_mask, ["glucose_g_l", "glucose_mol_l", "sample_volume_ml"]] = pd.NA
+
+    glucose_rows = merged.loc[glucose_mask].copy()
+    glucose_rows["time_h"] = glucose_rows["offline_time_h"]
+    glucose_rows["time_min"] = glucose_rows["time_h"] * 60.0
+    glucose_rows.loc[
+        :,
+        [
+            "biomass_g_l",
+            "DO_percent",
+            "O2_l_mol",
+            "pH",
+            "OUR_mol_min",
+            "CER_mol_min",
+            "CO2_offgas_fraction",
+            "RQ",
+        ],
+    ] = pd.NA
+
+    combined = pd.concat([online_rows, glucose_rows], ignore_index=True, sort=False)
+    return combined.drop(columns=["sampling_event_key"])
 
 
 def add_sampling_rate(frame: pd.DataFrame) -> pd.DataFrame:
@@ -249,8 +321,17 @@ def add_sampling_rate(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def keep_training_columns(frame: pd.DataFrame) -> pd.DataFrame:
-    measured = frame.loc[:, REQUIRED_MEASURED_TARGET_COLUMNS].notna().all(axis=1)
-    filtered = frame.loc[measured, FINAL_TRAINING_COLUMNS]
+    complete_online = frame.loc[:, REQUIRED_MEASURED_TARGET_COLUMNS].notna().all(axis=1)
+    cutoff_by_experiment = (
+        frame.loc[complete_online]
+        .groupby("Experiment_id", sort=False)["time_min"]
+        .max()
+        .rename("_online_cutoff_time_min")
+    )
+    with_cutoff = frame.merge(cutoff_by_experiment, on="Experiment_id", how="left")
+    before_cutoff = with_cutoff["time_min"] <= with_cutoff["_online_cutoff_time_min"]
+    has_observable = with_cutoff.loc[:, TRAINING_OBSERVABLE_COLUMNS].notna().any(axis=1)
+    filtered = with_cutoff.loc[before_cutoff & has_observable, FINAL_TRAINING_COLUMNS]
     return filtered.reset_index(drop=True).copy()
 
 
@@ -387,6 +468,27 @@ def preprocess(
     return paths
 
 
+def standardize_condition_labels(metadata: pd.DataFrame) -> pd.DataFrame:
+    standardized = metadata.copy()
+    parsed = standardized["raw_condition_label"].map(_parse_condition_label)
+    parsed_frame = pd.DataFrame(parsed.tolist(), index=standardized.index)
+
+    ph_values = parsed_frame["pH"].combine_first(pd.to_numeric(standardized["initial_pH"], errors="coerce"))
+    glucose_values = parsed_frame["G"].combine_first(
+        pd.to_numeric(standardized["initial_glucose_g_l"], errors="coerce")
+    )
+    do_values = parsed_frame["DO"].fillna(0.0)
+    afr_values = parsed_frame["AFR"].fillna(100.0)
+
+    standardized["condition_label"] = [
+        f"pH{_format_condition_value(ph)}_DO{_format_condition_value(do)}_G{_format_condition_value(glucose)}_AFR{_format_condition_value(afr)}"
+        for ph, do, glucose, afr in zip(ph_values, do_values, glucose_values, afr_values)
+    ]
+    standardized["DO_setpoint"] = do_values.astype(float)
+    standardized["AFR_setpoint"] = afr_values.astype(float)
+    return standardized.drop(columns=["raw_condition_label"])
+
+
 def _clean_column_name(column: str) -> str:
     return re.sub(r"\s+", " ", column).strip()
 
@@ -398,6 +500,7 @@ def _prepare_offline_metabolites(frame: pd.DataFrame, experiment_prefix: str) ->
     return prepared[[
         "experiment_prefix",
         "reactor_label",
+        "offline_time_h",
         "offline_sampling_events",
         "sample_volume_ml",
         "glucose_g_l",
@@ -452,6 +555,42 @@ def _experiment_id_from_tunniste(tunniste: object) -> str:
 def _experiment_id_from_reactor_label(prefix: object, reactor_label: object) -> str:
     match = re.search(r"(\d+)", str(reactor_label))
     return f"{prefix}_{match.group(1)}"
+
+
+def _parse_condition_label(label: object) -> dict[str, float | None]:
+    values: dict[str, float | None] = {"pH": None, "DO": None, "G": None, "AFR": None}
+    if pd.isna(label):
+        return values
+
+    text = str(label).strip()
+    for key in ("pH", "DO", "G", "AFR"):
+        match = re.search(rf"{key}0*([0-9]+(?:\.[0-9]+)?)", text, flags=re.IGNORECASE)
+        if match:
+            values[key] = float(match.group(1))
+
+    dash_match = re.match(
+        r"^(?P<kind>DO|AFR)0*(?P<primary>[0-9]+(?:\.[0-9]+)?)-(?P<ph>[0-9]+(?:\.[0-9]+)?)-G0*(?P<glucose>[0-9]+(?:\.[0-9]+)?)$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if dash_match:
+        values[dash_match.group("kind").upper()] = float(dash_match.group("primary"))
+        values["pH"] = float(dash_match.group("ph"))
+        values["G"] = float(dash_match.group("glucose"))
+
+    return values
+
+
+def _format_condition_value(value: object) -> str:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return "NA"
+    if not pd.notna(numeric):
+        return "NA"
+    if numeric.is_integer():
+        return str(int(numeric))
+    return f"{numeric:g}"
 
 
 def _extract_first_number(values: object) -> pd.Series:

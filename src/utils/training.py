@@ -348,13 +348,12 @@ def run_leave_one_bioreactor_out(
     """Run leave-one-bioreactor-out benchmarking for PINN.
 
     Each fold holds out one complete bioreactor, repeated across random seeds,
-    with metrics saved as long-form and mean/std summary CSV files.
+    with per-split metrics and runtime saved as CSV files.
     """
 
     import pandas as pd
 
     from src.utils.evaluation import (
-        OBSERVABLE_TABLE_LABELS,
         evaluate_observables,
         save_reports,
     )
@@ -368,7 +367,6 @@ def run_leave_one_bioreactor_out(
     output_dir.mkdir(parents=True, exist_ok=True)
     metrics_long_path = output_dir / "leave_one_out_metrics_long.csv"
     runtime_path = output_dir / "leave_one_out_runtime.csv"
-    table_path = output_dir / "leave_one_out_table.csv"
     fold_frame = _selected_experiment_frame(base_config.processed_csv, base_config.experiment_ids)
     folds = make_leave_one_bioreactor_out_folds(fold_frame)
     all_experiment_ids = [experiment_id for fold in folds for experiment_id in fold]
@@ -437,22 +435,14 @@ def run_leave_one_bioreactor_out(
         runtime = pd.read_csv(runtime_path)
     else:
         runtime = pd.DataFrame(runtime_rows)
-    table = _v1_metric_table(
-        metrics_long,
-        benchmark="Leave-One-Bioreactor-Out",
-        observable_labels=OBSERVABLE_TABLE_LABELS,
-    )
-    table.to_csv(table_path, index=False)
 
     return {
         "output_dir": str(output_dir),
         "metrics_long": metrics_long,
         "runtime": runtime,
-        "table": table,
         "paths": {
             "metrics_long": metrics_long_path,
             "runtime": runtime_path,
-            "table": table_path,
         },
         "results": kept_results,
     }
@@ -488,13 +478,10 @@ def _v1_metric_table(
         "Benchmark",
         "Observable",
         "R2 mean",
-        "R2 median",
         "R2 std",
         "MAE mean",
-        "MAE median",
         "MAE std",
         "NRMSE mean",
-        "NRMSE median",
         "NRMSE std",
     ]
     if metrics.empty:
@@ -503,7 +490,7 @@ def _v1_metric_table(
     test_metrics = metrics[metrics["split"].eq("test")].copy()
     grouped = (
         test_metrics.groupby("observable", dropna=False)[["r2", "mae", "nrmse"]]
-        .agg(["mean", "median", "std"])
+        .agg(["mean", "std"])
         .reset_index()
     )
     grouped.columns = _flatten_columns(grouped.columns)
@@ -513,13 +500,10 @@ def _v1_metric_table(
     grouped = grouped.rename(
         columns={
             "r2_mean": "R2 mean",
-            "r2_median": "R2 median",
             "r2_std": "R2 std",
             "mae_mean": "MAE mean",
-            "mae_median": "MAE median",
             "mae_std": "MAE std",
             "nrmse_mean": "NRMSE mean",
-            "nrmse_median": "NRMSE median",
             "nrmse_std": "NRMSE std",
         }
     )
@@ -652,6 +636,10 @@ def _config_json_payload(config: TrainingConfig, split_metadata: dict[str, objec
             "aux_fit_weights": [float(value) for value in config.aux_fit_weights],
             "res_eq_weights": [float(value) for value in config.res_eq_weights],
             "reg_eq_weights": [float(value) for value in config.reg_eq_weights],
+        },
+        "output": {
+            "results_dir": config.results_dir,
+            "experiment_name": config.experiment_name,
         },
     }
     if config.frozen_parameters:

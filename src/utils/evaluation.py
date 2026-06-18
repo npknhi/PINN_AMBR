@@ -3,8 +3,8 @@ from __future__ import annotations
 
 """Evaluation helpers for the AMBR Pseudomonas PINN flow."""
 
-from collections.abc import Sequence
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import matplotlib.pyplot as plt
@@ -17,15 +17,6 @@ from src.utils.training import predict_dataset
 
 
 GLUCOSE_MOLAR_MASS_G_MOL = 180.156
-
-OBSERVABLE_PLOT_COLORS = {
-    "glucose_g_l": "tab:blue",
-    "glucose_mol_l": "tab:blue",
-    "biomass_g_l": "tab:green",
-    "DO_percent": "tab:pink",
-    "O2_l_mol": "tab:pink",
-    "pH": "tab:orange",
-}
 
 OBSERVABLE_PLOT_TITLES = {
     "glucose_g_l": "Glucose",
@@ -267,26 +258,6 @@ def plot_r2_by_target(
     _save_figure(fig, output_path or _default_figure_path(result, "r2_by_target.png"))
 
 
-def plot_observable_predictions(
-    model,
-    dataset: PseudomonasDataset,
-    experiment_id: str | None = None,
-    output_path: str | Path | None = None,
-) -> None:
-    frame = prediction_frame(model, dataset)
-    if experiment_id is not None:
-        frame = frame[frame["Experiment_id"] == experiment_id]
-    if frame.empty:
-        raise ValueError("No rows available for plotting.")
-
-    title_suffix = experiment_id or _dataset_label(dataset)
-    _plot_prediction_frame(
-        frame,
-        title_suffix=title_suffix,
-        output_path=output_path or _default_prediction_figure_path(dataset, experiment_id),
-    )
-
-
 def plot_saved_observable_predictions(
     predictions_csv: str | Path,
     experiment_id: str | None = None,
@@ -305,26 +276,148 @@ def plot_saved_observable_predictions(
     return _plot_prediction_frame(frame, title_suffix=title_suffix, output_path=output)
 
 
-def plot_loo_test_predictions(
-    results_dir: str | Path = "results/LOO",
-    experiment_ids: Sequence[str] = (),
-    seed: int | None = None,
-    output_dir: str | Path | None = None,
-) -> dict[str, Path]:
-    """Plot saved test predictions for selected LOO held-out bioreactors."""
+def plot_saved_prediction_splits(
+    fold_dir: str | Path,
+    splits: tuple[str, ...] = ("test", "val"),
+) -> list[Path]:
+    """Create observable prediction figures from saved per-split prediction CSVs."""
+
+    fold_path = Path(fold_dir)
+    plot_paths = []
+    for split in splits:
+        predictions_csv = fold_path / f"predictions_{split}.csv"
+        if not predictions_csv.exists():
+            continue
+        frame = pd.read_csv(predictions_csv, usecols=["Experiment_id"])
+        experiment_ids = frame["Experiment_id"].dropna().astype(str).drop_duplicates().tolist()
+        if split == "train" and len(experiment_ids) > 1:
+            continue
+        experiment_id = experiment_ids[0] if len(experiment_ids) == 1 else None
+        label = experiment_id or split
+        output_path = fold_path / f"observable_predictions_{split}_{label}.png"
+        plot_paths.append(
+            plot_saved_observable_predictions(
+                predictions_csv,
+                experiment_id=experiment_id,
+                output_path=output_path,
+            )
+        )
+        plt.close("all")
+    return plot_paths
+
+
+def plot_saved_history(
+    fold_dir: str | Path,
+    plots: tuple[str, ...] = ("loss", "r2", "r2_by_target"),
+) -> list[Path]:
+    """Create history figures from a saved checkpoints/history.csv file."""
+
+    fold_path = Path(fold_dir)
+    history_result = _saved_history_result(fold_path)
+    if history_result is None:
+        return []
+
+    plot_paths = []
+    if "loss" in plots:
+        output_path = fold_path / "loss.png"
+        plot_loss(history_result, output_path=output_path)
+        plt.close("all")
+        plot_paths.append(output_path)
+    if "r2" in plots:
+        output_path = fold_path / "r2_mean.png"
+        plot_r2(history_result, output_path=output_path)
+        plt.close("all")
+        plot_paths.append(output_path)
+    if "r2_by_target" in plots:
+        output_path = fold_path / "r2_by_target.png"
+        plot_r2_by_target(history_result, output_path=output_path)
+        plt.close("all")
+        plot_paths.append(output_path)
+    return plot_paths
+
+
+def write_leave_one_out_table(
+    results_dir: str | Path,
+    *,
+    metrics_filename: str = "leave_one_out_metrics_long.csv",
+    table_filename: str = "leave_one_out_table.csv",
+    benchmark: str = "Leave-One-Bioreactor-Out",
+) -> Path:
+    """Create the LOO summary table from the saved long-form metrics CSV."""
 
     results_path = Path(results_dir)
-    output_path = Path(output_dir) if output_dir is not None else results_path / "diagnostic_plots"
-    paths: dict[str, Path] = {}
-    for experiment_id in experiment_ids:
-        prediction_csv = _loo_prediction_csv(results_path, experiment_id, seed=seed)
-        target_path = output_path / f"observable_predictions_{experiment_id}.png"
-        paths[str(experiment_id)] = plot_saved_observable_predictions(
-            prediction_csv,
-            experiment_id=experiment_id,
-            output_path=target_path,
-        )
-    return paths
+    metrics_path = results_path / metrics_filename
+    if not metrics_path.exists():
+        raise FileNotFoundError(f"Missing metrics file: {metrics_path}")
+
+    metrics = pd.read_csv(metrics_path)
+    table = leave_one_out_metric_table(
+        metrics,
+        benchmark=benchmark,
+        observable_labels=OBSERVABLE_TABLE_LABELS,
+    )
+    table_path = results_path / table_filename
+    table.to_csv(table_path, index=False)
+    return table_path
+
+
+def leave_one_out_metric_table(
+    metrics: pd.DataFrame,
+    *,
+    benchmark: str,
+    observable_labels: dict[str, str],
+) -> pd.DataFrame:
+    """Build the compact LOO table from long-form train/val/test metrics."""
+
+    columns = [
+        "Benchmark",
+        "Observable",
+        "R2 mean",
+        "R2 median",
+        "R2 std",
+        "MAE mean",
+        "MAE median",
+        "MAE std",
+        "NRMSE mean",
+        "NRMSE median",
+        "NRMSE std",
+    ]
+    if metrics.empty:
+        return pd.DataFrame(columns=columns)
+
+    test_metrics = metrics[metrics["split"].eq("test")].copy()
+    grouped = (
+        test_metrics.groupby("observable", dropna=False)[["r2", "mae", "nrmse"]]
+        .agg(["mean", "median", "std"])
+        .reset_index()
+    )
+    grouped.columns = _flatten_columns(grouped.columns)
+    grouped["Benchmark"] = benchmark
+    grouped["Observable"] = grouped["observable"].map(lambda value: observable_labels.get(str(value), str(value)))
+    grouped = grouped.rename(
+        columns={
+            "r2_mean": "R2 mean",
+            "r2_median": "R2 median",
+            "r2_std": "R2 std",
+            "mae_mean": "MAE mean",
+            "mae_median": "MAE median",
+            "mae_std": "MAE std",
+            "nrmse_mean": "NRMSE mean",
+            "nrmse_median": "NRMSE median",
+            "nrmse_std": "NRMSE std",
+        }
+    )
+    return grouped.loc[:, columns]
+
+
+def _flatten_columns(columns: Any) -> list[str]:
+    flattened = []
+    for column in columns:
+        if isinstance(column, tuple):
+            flattened.append("_".join(str(part) for part in column if part))
+        else:
+            flattened.append(str(column))
+    return flattened
 
 
 def _plot_prediction_frame(frame: pd.DataFrame, *, title_suffix: str, output_path: str | Path) -> Path:
@@ -398,13 +491,6 @@ def _result_title(result: dict[str, Any]) -> str:
     return "PINN"
 
 
-def _dataset_label(dataset: PseudomonasDataset) -> str:
-    unique_ids = pd.unique(dataset.frame["Experiment_id"].astype(str))
-    if len(unique_ids) == 1:
-        return str(unique_ids[0])
-    return "selected experiments"
-
-
 def _save_figure(fig, output_path: str | Path) -> Path:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -417,25 +503,29 @@ def _default_figure_path(result: dict[str, Any], filename: str) -> Path:
     return output_dir / filename
 
 
-def _default_prediction_figure_path(dataset: PseudomonasDataset, experiment_id: str | None) -> Path:
-    output_dir = Path(dataset.output_dir or Path("results") / (experiment_id or _dataset_label(dataset).replace(" ", "_")))
-    suffix = experiment_id or _dataset_label(dataset).replace(" ", "_")
-    return output_dir / f"observable_predictions_{suffix}.png"
-
-
 def _prediction_file_label(predictions_csv: str | Path) -> str:
     path = Path(predictions_csv)
     return path.parent.name or path.stem
 
 
-def _loo_prediction_csv(results_dir: Path, experiment_id: str, seed: int | None = None) -> Path:
-    seed_pattern = "*" if seed is None else str(seed)
-    matches = sorted(results_dir.glob(f"fold_*_{experiment_id}_seed_{seed_pattern}/predictions_test.csv"))
-    if not matches:
-        raise FileNotFoundError(f"No predictions_test.csv found for {experiment_id!r} under {results_dir}")
-    if len(matches) > 1 and seed is None:
-        raise ValueError(f"Multiple prediction files found for {experiment_id!r}; pass seed=... to disambiguate.")
-    return matches[0]
+def _saved_history_result(fold_dir: Path) -> dict | None:
+    history_path = fold_dir / "checkpoints" / "history.csv"
+    if not history_path.exists():
+        return None
+    history_frame = pd.read_csv(history_path)
+    history = {
+        column: history_frame[column].dropna().tolist()
+        for column in history_frame.columns
+    }
+    config = SimpleNamespace(
+        experiment_name=fold_dir.name,
+        num_epochs=len(history_frame),
+    )
+    return {
+        "history": history,
+        "config": config,
+        "output_dir": fold_dir,
+    }
 
 
 def save_reports(result: dict[str, Any], output_dir: str | Path | None = None) -> dict[str, Path]:
@@ -526,14 +616,16 @@ def _empty_metric_row(column: str) -> dict[str, float | str | int]:
 
 __all__ = [
     "evaluate_observables",
+    "leave_one_out_metric_table",
     "load_prediction_results",
     "parameter_report",
-    "plot_loo_test_predictions",
-    "plot_observable_predictions",
+    "plot_saved_history",
     "plot_saved_observable_predictions",
+    "plot_saved_prediction_splits",
     "plot_loss",
     "plot_r2",
     "plot_r2_by_target",
     "prediction_frame",
     "save_reports",
+    "write_leave_one_out_table",
 ]
