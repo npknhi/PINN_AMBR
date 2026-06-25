@@ -2,9 +2,7 @@
 """Parameters for the AMBR-oriented Pseudomonas putida bioprocess model.
 
 The state order follows the 22-state VTT model. Default kinetic and ODE values
-follow ``ODEModelPutida_LME_120326.ipynb``, the AMBR-oriented notebook.
-All dynamic states are amounts in mol, except biomass in g. Time is in minutes.
-The D5 medium recipe is kept as support data for metadata-based initialization.
+follow ``ODEModelPutida_LME_120326.ipynb``.
 """
 
 from __future__ import annotations
@@ -36,34 +34,8 @@ state_names = [
 ]
 
 
-medium_recipes_mmol_l = {
-    "D5": {
-        "K": 22.04520737,
-        "Na": 49.20911837,
-        "PO4": 43.17821854,
-        "SO4": 15.98793634,
-        "Cl": 0.865412502,
-        "Mg": 0.811470953,
-        "Ca": 0.0,
-        "NH4": 30.27229933,
-        "CO3": 5.951955813,
-        "EDTA": 0.067160971,
-        "Zn": 0.001738882,
-        "Fe": 0.008992612,
-        "MoO4": 0.000619947,
-        "Mn": 0.029584223,
-        "Co": 0.00420304,
-        "Cu": 0.000293296,
-        "Ni": 0.000420728,
-        "BO3": 0.024259676,
-    }
-}
-
-
 physical_parameters_dict = {
     "R": 8.31451,
-    "Tsc": 273.15,
-    "TCelsius": 30.0,
     "TKelvin": 303.15,
     "Pr": 101325.0,
 }
@@ -72,7 +44,6 @@ physical_parameters_dict = {
 volume_flow_parameters_dict = {
     "Vl": 0.2,
     "Vtotal": 0.25,
-    "Vgas": 0.05,
     "Vg": 0.105,
     "Vf": 0.0,
     "Vs": 0.0,
@@ -103,10 +74,6 @@ yield_parameters_dict = {
 }
 
 
-_D5 = medium_recipes_mmol_l["D5"]
-_MMOL_TO_MOL = 1e-3
-
-
 feed_concentration_parameters_dict = {
     "CSubs_f": 0.1,
     "CCl_f": 0.000887,
@@ -135,24 +102,19 @@ gas_parameters_dict = {
     "FractionO2": 0.21,
     "FractionCO2": 0.000407,
     "HenryConstantO2": 1.3e-8,
-    "HenryConstantCO2": 3.4e-7,
 }
 
-gas_parameters_dict["PartialPressureO2"] = (
-    gas_parameters_dict["FractionO2"] * physical_parameters_dict["Pr"]
-)
-gas_parameters_dict["PartialPressureCO2"] = (
-    gas_parameters_dict["FractionCO2"] * physical_parameters_dict["Pr"]
-)
 gas_parameters_dict["CSatO2"] = (
-    gas_parameters_dict["PartialPressureO2"] * gas_parameters_dict["HenryConstantO2"]
+    gas_parameters_dict["FractionO2"]
+    * physical_parameters_dict["Pr"]
+    * gas_parameters_dict["HenryConstantO2"]
 )
 gas_parameters_dict["CSatCO2"] = (
-    gas_parameters_dict["PartialPressureCO2"] * gas_parameters_dict["HenryConstantCO2"]
+    gas_parameters_dict["FractionCO2"] * physical_parameters_dict["Pr"] * 3.4e-7
 )
 gas_parameters_dict["TotalMolesGas"] = (
     physical_parameters_dict["Pr"]
-    * (volume_flow_parameters_dict["Vgas"] / 1000.0)
+    * ((volume_flow_parameters_dict["Vtotal"] - volume_flow_parameters_dict["Vl"]) / 1000.0)
     / (physical_parameters_dict["R"] * physical_parameters_dict["TKelvin"])
 )
 
@@ -161,32 +123,6 @@ pH_parameters_dict = {
     "pH_min": 5.0,
     "pH_opt": 6.5,
     "pH_max": 8.0,
-}
-
-
-initial_conditions_dict = {
-    "Substrate": 0.055,
-    "Biomass": 0.04267,
-    "Cl": 0.000173082,
-    "Co": 8.405819516967988e-7,
-    "Cu": 5.865708131748498e-8,
-    "Fe": 1.798470580618242e-6,
-    "Mg": 1.622889229695627e-4,
-    "Mo": 1.239887682707782e-7,
-    "Na": 0.009841767287091,
-    "Zn": 3.477547216397331e-7,
-    "K": 0.004408992875802,
-    "Ni": 8.414299934452604e-8,
-    "NH4": 0.006054221608728,
-    "P": 0.00863557426884131,
-    "S": 0.00319746255924881,
-    "CO2_l": gas_parameters_dict["CSatCO2"] * volume_flow_parameters_dict["Vl"],
-    "CO2_g": gas_parameters_dict["FractionCO2"] * gas_parameters_dict["TotalMolesGas"],
-    "O2_l": gas_parameters_dict["CSatO2"] * volume_flow_parameters_dict["Vl"],
-    "O2_g": gas_parameters_dict["FractionO2"] * gas_parameters_dict["TotalMolesGas"],
-    "HCO3": 0.00119,
-    "OH": 0.281,
-    "H": 0.2655,
 }
 
 

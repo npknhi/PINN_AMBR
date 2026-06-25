@@ -3,3 +3,5 @@ __pycache__/
 .ipynb_checkpoints/
 archive/
 data/raw/
+note
+benchmark_strategy_v1.1.md

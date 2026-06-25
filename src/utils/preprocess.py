@@ -19,6 +19,7 @@ GLUCOSE_MOLAR_MASS_G_MOL = 180.156
 STANDARD_PRESSURE_PA = 101325.0
 FRACTION_O2_AIR = 0.21
 HENRY_CONSTANT_O2_MOL_L_PA = 1.3e-8
+MAX_REASONABLE_SAMPLING_RATE_L_MIN = 0.01
 
 
 AMBR_COLUMN_RE = re.compile(r"^Bioreactor (?P<reactor>\d+) - (?P<measurement>.+)$")
@@ -280,43 +281,29 @@ def merge_offline_by_sampling_event(
         how="left",
         suffixes=("", "_offline"),
     )
-    glucose_mask = merged["glucose_g_l"].notna() & merged["offline_time_h"].notna()
-    if not glucose_mask.any():
-        return merged.drop(columns=["sampling_event_key"])
-
-    online_rows = merged.copy()
-    online_rows.loc[glucose_mask, ["glucose_g_l", "glucose_mol_l", "sample_volume_ml"]] = pd.NA
-
-    glucose_rows = merged.loc[glucose_mask].copy()
-    glucose_rows["time_h"] = glucose_rows["offline_time_h"]
-    glucose_rows["time_min"] = glucose_rows["time_h"] * 60.0
-    glucose_rows.loc[
-        :,
-        [
-            "biomass_g_l",
-            "DO_percent",
-            "O2_l_mol",
-            "pH",
-            "OUR_mol_min",
-            "CER_mol_min",
-            "CO2_offgas_fraction",
-            "RQ",
-        ],
-    ] = pd.NA
-
-    combined = pd.concat([online_rows, glucose_rows], ignore_index=True, sort=False)
-    return combined.drop(columns=["sampling_event_key"])
+    # The offline timestamp is often only a few microseconds after the matching
+    # online row. Keep one row per sampling event so that this numerical jitter
+    # cannot become an artificial near-zero sampling interval.
+    return merged.drop(columns=["sampling_event_key"])
 
 
 def add_sampling_rate(frame: pd.DataFrame) -> pd.DataFrame:
     sampled = _sort_by_experiment_and_time(frame, "time_min")
     dt_min = sampled.groupby("Experiment_id", sort=False)["time_min"].diff()
-    sampled["sample_volume_l"] = sampled["sample_volume_ml"] / 1000.0
+    sampled["sample_volume_l"] = pd.to_numeric(sampled["sample_volume_ml"], errors="coerce") / 1000.0
     sampled["sampling_rate_l_min"] = (sampled["sample_volume_l"] / dt_min).where(dt_min > 0, 0.0)
     sampled["acid_rate_l_min"] = _cumulative_rate_l_min(sampled, "acid_volume_pumped_ml", dt_min)
     sampled["base_rate_l_min"] = _cumulative_rate_l_min(sampled, "base_volume_pumped_ml", dt_min)
     sampled["sample_volume_l"] = sampled["sample_volume_l"].fillna(0.0)
     sampled["sampling_rate_l_min"] = sampled["sampling_rate_l_min"].fillna(0.0)
+    invalid = sampled["sampling_rate_l_min"] > MAX_REASONABLE_SAMPLING_RATE_L_MIN
+    if invalid.any():
+        columns = ["Experiment_id", "time_min", "sample_volume_l", "sampling_rate_l_min"]
+        examples = sampled.loc[invalid, columns].head(5).to_dict("records")
+        raise ValueError(
+            "Unphysical sampling rate detected after preprocessing; "
+            f"maximum allowed is {MAX_REASONABLE_SAMPLING_RATE_L_MIN:g} L/min. Examples: {examples}"
+        )
     return sampled
 
 

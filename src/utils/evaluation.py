@@ -45,14 +45,26 @@ OBSERVABLE_TABLE_LABELS = {
     "pH": "pH",
 }
 
+FORECAST_TABLE_ORDER = ("Biomass / OD", "Glucose", "DO", "pH")
+FORECAST_PLOT_ORDER = ("Glucose", "Biomass / OD", "DO", "pH")
 
-def evaluate_observables(model, dataset: PseudomonasDataset) -> pd.DataFrame:
+PLOT_TITLE_FONTSIZE = 12
+AXIS_LABEL_FONTSIZE = 10
+TICK_LABEL_FONTSIZE = 10
+LEGEND_FONTSIZE = 10
+
+
+def evaluate_observables(
+    model,
+    dataset: PseudomonasDataset,
+    predictions: dict[str, np.ndarray] | None = None,
+) -> pd.DataFrame:
     """Compute benchmark metrics where each observable has measured data.
 
     NRMSE uses the training-split variable range carried by the dataset.
     """
 
-    predictions = predict_dataset(model, dataset)
+    predictions = predictions or predict_dataset(model, dataset)
     rows = []
     for idx, column in enumerate(dataset.target_columns):
         mask = dataset.y_mask[:, idx]
@@ -82,10 +94,14 @@ def evaluate_observables(model, dataset: PseudomonasDataset) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def prediction_frame(model, dataset: PseudomonasDataset) -> pd.DataFrame:
+def prediction_frame(
+    model,
+    dataset: PseudomonasDataset,
+    predictions: dict[str, np.ndarray] | None = None,
+) -> pd.DataFrame:
     """Return measured columns plus model predictions for inspection/plotting."""
 
-    predictions = predict_dataset(model, dataset)
+    predictions = predictions or predict_dataset(model, dataset)
     observable_columns = [_reported_observable_name(column) for column in dataset.target_columns]
     if "pH" in dataset.frame.columns and "pH" in predictions and "pH" not in observable_columns:
         observable_columns.append("pH")
@@ -167,13 +183,14 @@ def plot_loss(
         for key in loss_keys:
             values = history.get(key, [])
             if values:
-                ax.plot(values, color=loss_colors[key], linewidth=1.8, label=loss_labels[key], linestyle="-")
+                ax.plot(values, color=loss_colors[key], linewidth=1.4, label=loss_labels[key], linestyle="-")
         ax.set_xscale("log")
         ax.set_yscale("log")
-        ax.set_xlabel("Epochs", fontsize=9)
-        ax.set_ylabel("Loss", fontsize=9)
-        ax.legend(fontsize=8)
-    ax.set_title(_result_title(result), fontsize=9, fontweight="bold")
+        ax.set_xlabel("Epochs", fontsize=AXIS_LABEL_FONTSIZE)
+        ax.set_ylabel("Loss", fontsize=AXIS_LABEL_FONTSIZE)
+        ax.tick_params(axis="both", labelsize=TICK_LABEL_FONTSIZE)
+        ax.legend(fontsize=LEGEND_FONTSIZE)
+    ax.set_title(_result_title(result), fontsize=PLOT_TITLE_FONTSIZE, fontweight="normal")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     _save_figure(fig, output_path or _default_figure_path(result, "loss.png"))
@@ -186,26 +203,31 @@ def plot_r2(
     """Plot mean train/test R2 score per epoch."""
 
     history = result.get("history", {})
-    r2_train = history.get("r2_scores_train", [])
-    r2_val = history.get("r2_scores_val", [])
+    r2_train = np.asarray(history.get("r2_scores_train", []), dtype=float)
+    r2_val = np.asarray(history.get("r2_scores_val", []), dtype=float)
+    has_train = r2_train.size > 0 and np.isfinite(r2_train).any()
+    has_val = r2_val.size > 0 and np.isfinite(r2_val).any()
 
     fig, ax = plt.subplots(1, 1, figsize=(5, 3.5))
-    if not r2_train or not r2_val:
+    if not has_train and not has_val:
         ax.text(0.5, 0.5, "no R2 history", ha="center", va="center", transform=ax.transAxes)
     else:
-        train_epochs = np.arange(1, len(r2_train) + 1)
-        val_epochs = np.arange(1, len(r2_val) + 1)
-        ax.plot(train_epochs, r2_train, color="tab:blue", linewidth=2, label="R2 train")
-        ax.plot(val_epochs, r2_val, color="tab:green", linewidth=2, label="R2 val")
-        ax.legend(fontsize=8)
+        if has_train:
+            train_epochs = np.arange(1, len(r2_train) + 1)
+            ax.plot(train_epochs, r2_train, color="tab:blue", linewidth=1.4, label="R2 train")
+        if has_val:
+            val_epochs = np.arange(1, len(r2_val) + 1)
+            ax.plot(val_epochs, r2_val, color="tab:green", linewidth=1.4, label="R2 val")
+        ax.legend(fontsize=LEGEND_FONTSIZE)
         ax.set_xscale("log")
         config = result.get("config")
         num_epochs = int(getattr(config, "num_epochs", max(len(r2_train), len(r2_val))))
         ax.set_xlim(1, num_epochs)
 
-    ax.set_title(_result_title(result), fontsize=10, fontweight="bold")
-    ax.set_xlabel("Epochs", fontsize=9)
-    ax.set_ylabel("R2 Score", fontsize=9)
+    ax.set_title(_result_title(result), fontsize=PLOT_TITLE_FONTSIZE, fontweight="normal")
+    ax.set_xlabel("Epochs", fontsize=AXIS_LABEL_FONTSIZE)
+    ax.set_ylabel("R2 Score", fontsize=AXIS_LABEL_FONTSIZE)
+    ax.tick_params(axis="both", labelsize=TICK_LABEL_FONTSIZE)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     _save_figure(fig, output_path or _default_figure_path(result, "r2_mean.png"))
@@ -227,30 +249,33 @@ def plot_r2_by_target(
     nrows = int(np.ceil(len(columns) / ncols)) if columns else 1
     fig, axes = plt.subplots(nrows, ncols, figsize=(5.3333 * ncols, 3 * nrows), sharex=True)
     axes_array = np.atleast_1d(axes).ravel()
-    fig.suptitle(f"R2 Evolution - {_result_title(result)}", fontsize=16, fontweight="bold")
+    fig.suptitle(f"R2 Evolution - {_result_title(result)}", fontsize=PLOT_TITLE_FONTSIZE, fontweight="normal")
 
     if not columns:
         axes_array[0].text(0.5, 0.5, "no target R2 history", ha="center", va="center", transform=axes_array[0].transAxes)
     for idx, (ax, column) in enumerate(zip(axes_array, columns)):
-        train_values = history.get(f"r2_train_{column}", [])
-        val_values = history.get(f"r2_val_{column}", [])
+        train_values = np.asarray(history.get(f"r2_train_{column}", []), dtype=float)
+        val_values = np.asarray(history.get(f"r2_val_{column}", []), dtype=float)
+        has_train = train_values.size > 0 and np.isfinite(train_values).any()
+        has_val = val_values.size > 0 and np.isfinite(val_values).any()
 
-        if train_values:
+        if has_train:
             train_epochs = np.arange(1, len(train_values) + 1)
-            ax.plot(train_epochs, train_values, color="tab:blue", linewidth=2, label="R2 train")
-        if val_values:
+            ax.plot(train_epochs, train_values, color="tab:blue", linewidth=1.4, label="R2 train")
+        if has_val:
             val_epochs = np.arange(1, len(val_values) + 1)
-            ax.plot(val_epochs, val_values, color="tab:green", linewidth=2, label="R2 val")
+            ax.plot(val_epochs, val_values, color="tab:green", linewidth=1.4, label="R2 val")
 
-        ax.set_title(OBSERVABLE_PLOT_TITLES.get(column, column), fontweight="bold", fontsize=12)
-        ax.set_ylabel("R2 Score", fontsize=10)
+        ax.set_title(OBSERVABLE_PLOT_TITLES.get(column, column), fontweight="normal", fontsize=PLOT_TITLE_FONTSIZE)
+        ax.set_ylabel("R2 Score", fontsize=AXIS_LABEL_FONTSIZE)
         ax.set_xscale("log")
+        ax.tick_params(axis="both", labelsize=TICK_LABEL_FONTSIZE)
         if idx // ncols == nrows - 1:
-            ax.set_xlabel("Epochs", fontsize=10)
+            ax.set_xlabel("Epochs", fontsize=AXIS_LABEL_FONTSIZE)
         ax.grid(True, alpha=0.3)
         handles, labels = ax.get_legend_handles_labels()
         if handles:
-            ax.legend(handles, labels, loc="best", fontsize=9)
+            ax.legend(handles, labels, loc="best", fontsize=LEGEND_FONTSIZE)
 
     for ax in axes_array[len(columns):]:
         ax.axis("off")
@@ -262,6 +287,7 @@ def plot_saved_observable_predictions(
     predictions_csv: str | Path,
     experiment_id: str | None = None,
     output_path: str | Path | None = None,
+    title: str | None = None,
 ) -> Path:
     """Plot measured vs saved PINN predictions from a predictions CSV."""
 
@@ -273,7 +299,7 @@ def plot_saved_observable_predictions(
 
     title_suffix = experiment_id or _prediction_file_label(predictions_csv)
     output = output_path or Path(predictions_csv).with_name(f"observable_predictions_{title_suffix}.png")
-    return _plot_prediction_frame(frame, title_suffix=title_suffix, output_path=output)
+    return _plot_prediction_frame(frame, title=title or title_suffix, output_path=output)
 
 
 def plot_saved_prediction_splits(
@@ -294,12 +320,13 @@ def plot_saved_prediction_splits(
             continue
         experiment_id = experiment_ids[0] if len(experiment_ids) == 1 else None
         label = experiment_id or split
-        output_path = fold_path / f"observable_predictions_{split}_{label}.png"
+        output_path = fold_path / f"{split}_{label}.png"
         plot_paths.append(
             plot_saved_observable_predictions(
                 predictions_csv,
                 experiment_id=experiment_id,
                 output_path=output_path,
+                title=fold_path.name,
             )
         )
         plt.close("all")
@@ -361,13 +388,47 @@ def write_leave_one_out_table(
     return table_path
 
 
+def write_hierarchical_leave_one_out_table(
+    results_dir: str | Path,
+    *,
+    table_filename: str = "leave_one_out_table.csv",
+    benchmark: str = "Leave-One-Bioreactor-Out",
+) -> Path:
+    """Aggregate seeds within each fold, then summarize across fold means."""
+
+    results_path = Path(results_dir)
+    metric_paths = sorted(results_path.glob("seed_*/leave_one_out_metrics_long.csv"))
+    if not metric_paths:
+        raise FileNotFoundError(f"No seed metrics found under: {results_path}")
+    metrics = pd.concat((pd.read_csv(path) for path in metric_paths), ignore_index=True)
+    required = {"fold_index", "observable", "r2", "mae", "nrmse"}
+    missing = sorted(required - set(metrics.columns))
+    if missing:
+        raise ValueError(f"LOO seed metrics are missing columns: {missing}")
+
+    test_metrics = metrics[metrics["split"].eq("test")].copy() if "split" in metrics.columns else metrics.copy()
+    fold_means = (
+        test_metrics.groupby(["fold_index", "observable"], dropna=False)[["r2", "mae", "nrmse"]]
+        .mean()
+        .reset_index()
+    )
+    table = leave_one_out_metric_table(
+        fold_means,
+        benchmark=benchmark,
+        observable_labels=OBSERVABLE_TABLE_LABELS,
+    )
+    table_path = results_path / table_filename
+    table.to_csv(table_path, index=False)
+    return table_path
+
+
 def leave_one_out_metric_table(
     metrics: pd.DataFrame,
     *,
     benchmark: str,
     observable_labels: dict[str, str],
 ) -> pd.DataFrame:
-    """Build the compact LOO table from long-form train/val/test metrics."""
+    """Build the compact LOO table from long-form test metrics."""
 
     columns = [
         "Benchmark",
@@ -385,7 +446,7 @@ def leave_one_out_metric_table(
     if metrics.empty:
         return pd.DataFrame(columns=columns)
 
-    test_metrics = metrics[metrics["split"].eq("test")].copy()
+    test_metrics = metrics[metrics["split"].eq("test")].copy() if "split" in metrics.columns else metrics.copy()
     grouped = (
         test_metrics.groupby("observable", dropna=False)[["r2", "mae", "nrmse"]]
         .agg(["mean", "median", "std"])
@@ -407,7 +468,10 @@ def leave_one_out_metric_table(
             "nrmse_std": "NRMSE std",
         }
     )
-    return grouped.loc[:, columns]
+    observable_order = {"Biomass / OD": 0, "Glucose": 1, "DO": 2, "pH": 3}
+    grouped["_observable_order"] = grouped["Observable"].map(observable_order).fillna(len(observable_order))
+    grouped = grouped.sort_values("_observable_order").drop(columns="_observable_order")
+    return grouped.loc[:, columns].reset_index(drop=True)
 
 
 def _flatten_columns(columns: Any) -> list[str]:
@@ -420,7 +484,14 @@ def _flatten_columns(columns: Any) -> list[str]:
     return flattened
 
 
-def _plot_prediction_frame(frame: pd.DataFrame, *, title_suffix: str, output_path: str | Path) -> Path:
+def _plot_prediction_frame(
+    frame: pd.DataFrame,
+    *,
+    title: str,
+    output_path: str | Path,
+    forecast_start_h: float | None = None,
+    metric_start_h: float | None = None,
+) -> Path:
     if frame.empty:
         raise ValueError("No rows available for plotting.")
     columns = [column[:-5] for column in frame.columns if column.endswith("_pred")]
@@ -428,9 +499,9 @@ def _plot_prediction_frame(frame: pd.DataFrame, *, title_suffix: str, output_pat
     nrows = int(np.ceil(len(columns) / ncols))
     fig, axes = plt.subplots(nrows, ncols, figsize=(5.3333 * ncols, 3 * nrows), sharex=True)
     axes_array = np.atleast_1d(axes).ravel()
-    fig.suptitle(f"PINN vs Data Comparison - {title_suffix}", fontsize=16, fontweight="bold")
-    data_color = "tab:green"
-    pinn_color = "tab:blue"
+    fig.suptitle(title, fontsize=PLOT_TITLE_FONTSIZE, fontweight="normal")
+    data_color = "tab:blue"
+    pinn_color = "tab:orange"
 
     for idx, (ax, column) in enumerate(zip(axes_array, columns)):
         measured = frame[column].notna()
@@ -439,12 +510,12 @@ def _plot_prediction_frame(frame: pd.DataFrame, *, title_suffix: str, output_pat
             ax.plot(
                 measured_frame["time_h"],
                 measured_frame[column],
-                "--o",
+                "o",
                 label="Data",
                 color=data_color,
-                linewidth=2.5,
-                markersize=3.5,
-                alpha=0.75,
+                linestyle="None",
+                markersize=2.4,
+                alpha=0.9,
             )
         ax.plot(
             frame["time_h"],
@@ -452,26 +523,56 @@ def _plot_prediction_frame(frame: pd.DataFrame, *, title_suffix: str, output_pat
             "--",
             label="PINN",
             color=pinn_color,
-            linewidth=2.5,
-            alpha=0.85,
+            linewidth=1.4,
+            alpha=0.95,
         )
-        ax.set_title(OBSERVABLE_PLOT_TITLES.get(column, column), fontweight="bold", fontsize=12)
-        ax.set_ylabel(OBSERVABLE_PLOT_YLABELS.get(column, column), fontsize=10)
+        if forecast_start_h is not None and np.isfinite(forecast_start_h):
+            ax.axvline(
+                forecast_start_h,
+                color="gray",
+                linestyle="--",
+                linewidth=1.2,
+                alpha=0.9,
+                label="Forecast start",
+            )
+        metric_rows = measured & frame[f"{column}_pred"].notna()
+        if metric_start_h is not None and np.isfinite(metric_start_h):
+            metric_rows &= pd.to_numeric(frame["time_h"], errors="coerce") > metric_start_h
+        if metric_rows.any():
+            measured_frame = frame.loc[metric_rows].sort_values("time_h")
+            r2_value = _safe_r2(
+                measured_frame[column].to_numpy(),
+                measured_frame[f"{column}_pred"].to_numpy(),
+            )
+            if np.isfinite(r2_value):
+                ax.text(
+                    0.62,
+                    0.48,
+                    f"R2 = {r2_value:.4f}",
+                    transform=ax.transAxes,
+                    fontsize=AXIS_LABEL_FONTSIZE,
+                    ha="left",
+                    va="center",
+                )
+        ax.set_title(OBSERVABLE_PLOT_TITLES.get(column, column), fontweight="normal", fontsize=PLOT_TITLE_FONTSIZE)
+        ax.set_ylabel(OBSERVABLE_PLOT_YLABELS.get(column, column), fontsize=AXIS_LABEL_FONTSIZE)
+        ax.tick_params(axis="both", labelsize=TICK_LABEL_FONTSIZE)
         if idx // ncols == nrows - 1:
-            ax.set_xlabel("Time (h)", fontsize=10)
+            ax.set_xlabel("Time (h)", fontsize=AXIS_LABEL_FONTSIZE)
         ax.grid(True, alpha=0.3)
         handles, labels = ax.get_legend_handles_labels()
         legend_map = dict(zip(labels, handles))
         ordered_labels = [
             "PINN",
             "Data",
+            "Forecast start",
         ]
         ordered_labels = [name for name in ordered_labels if name in legend_map]
         if ordered_labels:
             ordered_handles = [legend_map[name] for name in ordered_labels]
-            ax.legend(ordered_handles, ordered_labels, loc="best", fontsize=9)
+            ax.legend(ordered_handles, ordered_labels, loc="best", fontsize=LEGEND_FONTSIZE)
         else:
-            ax.legend(loc="best", fontsize=9)
+            ax.legend(loc="best", fontsize=LEGEND_FONTSIZE)
 
     for ax in axes_array[len(columns):]:
         ax.axis("off")
@@ -534,7 +635,10 @@ def save_reports(result: dict[str, Any], output_dir: str | Path | None = None) -
     train_dataset = result["train_dataset"]
     val_dataset = result.get("val_dataset")
     test_dataset = result["test_dataset"]
-    metrics = evaluate_observables(result["model"], train_dataset)
+    train_predictions = result.get("train_predictions")
+    val_predictions = result.get("val_predictions")
+    test_predictions = result.get("test_predictions")
+    metrics = evaluate_observables(result["model"], train_dataset, train_predictions)
     params = parameter_report(result)
     train_metrics_path = output / "metrics_train.csv"
     test_metrics_path = output / "metrics_test.csv"
@@ -542,10 +646,10 @@ def save_reports(result: dict[str, Any], output_dir: str | Path | None = None) -
     predictions_train_path = output / "predictions_train.csv"
     predictions_test_path = output / "predictions_test.csv"
     metrics.to_csv(train_metrics_path, index=False)
-    evaluate_observables(result["model"], test_dataset).to_csv(test_metrics_path, index=False)
+    evaluate_observables(result["model"], test_dataset, test_predictions).to_csv(test_metrics_path, index=False)
     params.to_csv(params_path, index=False)
-    prediction_frame(result["model"], train_dataset).to_csv(predictions_train_path, index=False)
-    prediction_frame(result["model"], test_dataset).to_csv(predictions_test_path, index=False)
+    prediction_frame(result["model"], train_dataset, train_predictions).to_csv(predictions_train_path, index=False)
+    prediction_frame(result["model"], test_dataset, test_predictions).to_csv(predictions_test_path, index=False)
     paths = {
         "metrics_train": train_metrics_path,
         "metrics_test": test_metrics_path,
@@ -556,8 +660,8 @@ def save_reports(result: dict[str, Any], output_dir: str | Path | None = None) -
     if val_dataset is not None:
         metrics_val_path = output / "metrics_val.csv"
         predictions_val_path = output / "predictions_val.csv"
-        evaluate_observables(result["model"], val_dataset).to_csv(metrics_val_path, index=False)
-        prediction_frame(result["model"], val_dataset).to_csv(predictions_val_path, index=False)
+        evaluate_observables(result["model"], val_dataset, val_predictions).to_csv(metrics_val_path, index=False)
+        prediction_frame(result["model"], val_dataset, val_predictions).to_csv(predictions_val_path, index=False)
         paths.update(
             {
                 "metrics_val": metrics_val_path,
@@ -614,18 +718,272 @@ def _empty_metric_row(column: str) -> dict[str, float | str | int]:
     return {"observable": column, "n": 0, "nrmse": np.nan, "mae": np.nan, "r2": np.nan}
 
 
+def regression_metric_values(y_true: np.ndarray, y_pred: np.ndarray, scale: float) -> dict[str, float]:
+    """Compute the same R2, MAE and train-range NRMSE used by LOO."""
+
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    valid = np.isfinite(y_true) & np.isfinite(y_pred)
+    y_true = y_true[valid]
+    y_pred = y_pred[valid]
+    if y_true.size == 0:
+        return {"r2": np.nan, "mae": np.nan, "nrmse": np.nan}
+    rmse = float(mean_squared_error(y_true, y_pred) ** 0.5)
+    return {
+        "r2": _safe_r2(y_true, y_pred),
+        "mae": float(mean_absolute_error(y_true, y_pred)),
+        "nrmse": _safe_nrmse(rmse, scale),
+    }
+
+
+def forecasting_metric_table(
+    metrics: pd.DataFrame,
+    *,
+    benchmark: str = "Forecasting Scan",
+    include_observation_fraction: bool = True,
+    include_r2: bool = True,
+) -> pd.DataFrame:
+    """Average seeds per reactor first, then summarize across reactor means."""
+
+    columns = [
+        "Benchmark",
+        "Observable",
+        "MAE mean",
+        "MAE median",
+        "MAE std",
+        "NRMSE mean",
+        "NRMSE median",
+        "NRMSE std",
+    ]
+    if include_r2:
+        columns[2:2] = ["R2 mean", "R2 median", "R2 std"]
+    if include_observation_fraction:
+        columns.insert(1, "Observation fraction")
+    if metrics.empty:
+        return pd.DataFrame(columns=columns)
+    metric_columns = ["mae", "nrmse"]
+    if include_r2:
+        metric_columns.insert(0, "r2")
+    required = {"observation_fraction", "Experiment_id", "observable", *metric_columns}
+    missing = sorted(required - set(metrics.columns))
+    if missing:
+        raise ValueError(f"Forecasting metrics are missing columns: {missing}")
+    reactor_means = (
+        metrics.groupby(["observation_fraction", "Experiment_id", "observable"], dropna=False)[
+            metric_columns
+        ]
+        .mean()
+        .reset_index()
+    )
+    grouped = (
+        reactor_means.groupby(["observation_fraction", "observable"], dropna=False)[metric_columns]
+        .agg(["mean", "median", "std"])
+        .reset_index()
+    )
+    grouped.columns = _flatten_columns(grouped.columns)
+    grouped["Benchmark"] = benchmark
+    grouped["Observation fraction"] = grouped["observation_fraction"]
+    grouped["Observable"] = grouped["observable"].map(
+        lambda value: OBSERVABLE_TABLE_LABELS.get(str(value), str(value))
+    )
+    grouped = grouped.rename(
+        columns={
+            "r2_mean": "R2 mean",
+            "r2_median": "R2 median",
+            "r2_std": "R2 std",
+            "mae_mean": "MAE mean",
+            "mae_median": "MAE median",
+            "mae_std": "MAE std",
+            "nrmse_mean": "NRMSE mean",
+            "nrmse_median": "NRMSE median",
+            "nrmse_std": "NRMSE std",
+        }
+    )
+    order = {name: index for index, name in enumerate(FORECAST_TABLE_ORDER)}
+    grouped["_observable_order"] = grouped["Observable"].map(order).fillna(len(order))
+    grouped = grouped.sort_values(["Observation fraction", "_observable_order"]).drop(columns="_observable_order")
+    return grouped.loc[:, columns].reset_index(drop=True)
+
+
+def write_forecasting_table(
+    results_dir: str | Path,
+    *,
+    metrics_filename: str = "forecasting_metrics_long.csv",
+    table_filename: str = "forecasting_table.csv",
+    benchmark: str = "Forecasting Scan",
+    include_r2: bool = True,
+) -> Path:
+    results_path = Path(results_dir)
+    metrics_path = results_path / metrics_filename
+    if not metrics_path.exists():
+        raise FileNotFoundError(f"Missing forecasting metrics: {metrics_path}")
+    metrics = pd.read_csv(metrics_path)
+    metrics["observation_fraction"] = _forecast_fraction_from_path(results_path)
+    table = forecasting_metric_table(
+        metrics,
+        benchmark=benchmark,
+        include_observation_fraction=False,
+        include_r2=include_r2,
+    )
+    table_path = results_path / table_filename
+    table.to_csv(table_path, index=False)
+    return table_path
+
+
+def write_hierarchical_forecasting_table(
+    results_dir: str | Path,
+    *,
+    metrics_filename: str = "forecasting_metrics_long.csv",
+    table_filename: str = "forecasting_table.csv",
+    benchmark: str = "Forecasting Scan",
+    include_r2: bool = True,
+) -> Path:
+    results_path = Path(results_dir)
+    metric_paths = sorted(results_path.glob(f"seed_*/fraction_*/{metrics_filename}"))
+    if not metric_paths:
+        raise FileNotFoundError(f"No seed forecasting metrics found under: {results_path}")
+    frames = []
+    for path in metric_paths:
+        frame = pd.read_csv(path)
+        frame["observation_fraction"] = _forecast_fraction_from_path(path.parent)
+        frames.append(frame)
+    metrics = pd.concat(frames, ignore_index=True)
+    table = forecasting_metric_table(metrics, benchmark=benchmark, include_r2=include_r2)
+    table_path = results_path / table_filename
+    table.to_csv(table_path, index=False)
+    return table_path
+
+
+def plot_forecasting_curves(
+    table: pd.DataFrame,
+    output_dir: str | Path,
+    *,
+    filename_suffix: str = "",
+) -> dict[str, Path]:
+    """Plot forecasting metric curves."""
+
+    output_path = Path(output_dir)
+    outputs = {}
+    specs = {
+        "r2": ("R2 mean", "Forecast R2", f"forecast_r2_curve{filename_suffix}.png"),
+        "mae": ("MAE mean", "Forecast MAE", f"forecast_mae_curve{filename_suffix}.png"),
+        "nrmse": ("NRMSE mean", "Forecast NRMSE", f"forecast_nrmse_curve{filename_suffix}.png"),
+    }
+    for key, (column, ylabel, filename) in specs.items():
+        if column not in table.columns:
+            continue
+        fig, axes = plt.subplots(2, 2, figsize=(10.6666, 6), sharex=True)
+        for ax, observable in zip(axes.ravel(), FORECAST_PLOT_ORDER):
+            data = table[table["Observable"].eq(observable)].sort_values("Observation fraction")
+            if data.empty:
+                ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
+            else:
+                ax.plot(data["Observation fraction"], data[column], color="tab:blue", marker="o", linewidth=1.4)
+            ax.set_title(observable, fontsize=PLOT_TITLE_FONTSIZE, fontweight="normal")
+            ax.set_ylabel(ylabel, fontsize=AXIS_LABEL_FONTSIZE)
+            ax.tick_params(axis="both", labelsize=TICK_LABEL_FONTSIZE)
+            ax.grid(True, alpha=0.3)
+        for ax in axes.ravel()[2:]:
+            ax.set_xlabel("Observed trajectory fraction", fontsize=AXIS_LABEL_FONTSIZE)
+        fig.tight_layout()
+        path = output_path / filename
+        _save_figure(fig, path)
+        plt.close(fig)
+        outputs[key] = path
+    return outputs
+
+
+def plot_saved_forecast_predictions(
+    predictions_csv: str | Path,
+    *,
+    output_path: str | Path | None = None,
+    forecast_start_h: float | None = None,
+    filename_suffix: str = "",
+) -> Path:
+    """Plot one saved reactor forecast."""
+
+    predictions_path = Path(predictions_csv)
+    frame = pd.read_csv(predictions_path)
+    if frame.empty:
+        raise ValueError(f"No forecast predictions in {predictions_path}")
+    plot_frame = frame.copy()
+    for column in tuple(plot_frame.columns):
+        if column.endswith("_forecast"):
+            plot_frame[column.removesuffix("_forecast") + "_pred"] = plot_frame[column]
+    experiment_ids = plot_frame["Experiment_id"].dropna().astype(str).unique().tolist()
+    experiment_label = experiment_ids[0] if len(experiment_ids) == 1 else predictions_path.parent.name
+    fraction_label = predictions_path.parent.parent.name
+    title = f"{fraction_label} - {experiment_label}"
+    time_h = pd.to_numeric(plot_frame["time_h"], errors="coerce").to_numpy(dtype=float)
+    finite_time = time_h[np.isfinite(time_h)]
+    if forecast_start_h is None and finite_time.size:
+        fraction = _forecast_fraction_from_path(predictions_path)
+        forecast_start_h = float(finite_time.min() + fraction * (finite_time.max() - finite_time.min()))
+    elif forecast_start_h is None:
+        forecast_start_h = None
+    output = (
+        Path(output_path)
+        if output_path is not None
+        else predictions_path.with_name(f"test_{experiment_label}{filename_suffix}.png")
+    )
+    return _plot_prediction_frame(
+        plot_frame,
+        title=title,
+        output_path=output,
+        forecast_start_h=forecast_start_h,
+        metric_start_h=forecast_start_h,
+    )
+
+
+def _forecast_fraction_from_path(path: Path) -> float:
+    for part in (path, *path.parents):
+        if part.name.startswith("fraction_"):
+            try:
+                return float(part.name.split("_", 1)[1]) / 100.0
+            except ValueError as exc:
+                raise ValueError(f"Invalid forecasting fraction directory: {part}") from exc
+    raise ValueError(f"No fraction directory found in path: {path}")
+
+
+def plot_saved_forecasting_predictions(
+    results_dir: str | Path,
+    *,
+    filename_suffix: str = "",
+) -> list[Path]:
+    """Plot all saved reactor forecasts."""
+
+    paths = []
+    for predictions_path in sorted(Path(results_dir).glob("seed_*/fraction_*/fold_*/predictions_test.csv")):
+        paths.append(
+            plot_saved_forecast_predictions(
+                predictions_path,
+                filename_suffix=filename_suffix,
+            )
+        )
+        plt.close("all")
+    return paths
+
+
 __all__ = [
     "evaluate_observables",
+    "forecasting_metric_table",
     "leave_one_out_metric_table",
     "load_prediction_results",
     "parameter_report",
     "plot_saved_history",
+    "plot_saved_forecast_predictions",
+    "plot_saved_forecasting_predictions",
     "plot_saved_observable_predictions",
     "plot_saved_prediction_splits",
     "plot_loss",
+    "plot_forecasting_curves",
     "plot_r2",
     "plot_r2_by_target",
     "prediction_frame",
     "save_reports",
+    "regression_metric_values",
+    "write_forecasting_table",
+    "write_hierarchical_forecasting_table",
     "write_leave_one_out_table",
+    "write_hierarchical_leave_one_out_table",
 ]
