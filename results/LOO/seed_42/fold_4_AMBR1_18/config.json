@@ -33,7 +33,6 @@
     "validation_strategy": "random",
     "validation_seed": 42,
     "fold_index": 4,
-    "forecast_observation_fraction": null,
     "n_splits": 22
   },
   "model": {
@@ -57,7 +56,7 @@
     "early_stopping_patience": 1000,
     "early_stopping_min_delta": 0.0001,
     "restore_best_weights": true,
-    "track_epoch_r2": false,
+    "track_epoch_r2": true,
     "save_config": true,
     "save_checkpoint": true
   },
@@ -144,9 +143,5 @@
       1e-06,
       1e-06
     ]
-  },
-  "output": {
-    "results_dir": "results/LOO/seed_42",
-    "experiment_name": "fold_4_AMBR1_18"
   }
 }

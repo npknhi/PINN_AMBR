@@ -223,6 +223,7 @@ def plot_r2(
         config = result.get("config")
         num_epochs = int(getattr(config, "num_epochs", max(len(r2_train), len(r2_val))))
         ax.set_xlim(1, num_epochs)
+    ax.set_ylim(-0.05, 1.05)
 
     ax.set_title(_result_title(result), fontsize=PLOT_TITLE_FONTSIZE, fontweight="normal")
     ax.set_xlabel("Epochs", fontsize=AXIS_LABEL_FONTSIZE)
@@ -269,6 +270,7 @@ def plot_r2_by_target(
         ax.set_title(OBSERVABLE_PLOT_TITLES.get(column, column), fontweight="normal", fontsize=PLOT_TITLE_FONTSIZE)
         ax.set_ylabel("R2 Score", fontsize=AXIS_LABEL_FONTSIZE)
         ax.set_xscale("log")
+        ax.set_ylim(-0.05, 1.05)
         ax.tick_params(axis="both", labelsize=TICK_LABEL_FONTSIZE)
         if idx // ncols == nrows - 1:
             ax.set_xlabel("Epochs", fontsize=AXIS_LABEL_FONTSIZE)
@@ -872,6 +874,15 @@ def plot_forecasting_curves(
     for key, (column, ylabel, filename) in specs.items():
         if column not in table.columns:
             continue
+        finite_values = pd.to_numeric(table[column], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+        shared_ylim: tuple[float, float] | None = None
+        if key == "r2":
+            shared_ylim = (-0.05, 1.05)
+        elif key in {"mae", "nrmse"} and not finite_values.empty:
+            max_value = float(finite_values.max())
+            if max_value > 0.0:
+                padding = 0.05 * max_value
+                shared_ylim = (-padding, max_value + padding)
         fig, axes = plt.subplots(2, 2, figsize=(10.6666, 6), sharex=True)
         for ax, observable in zip(axes.ravel(), FORECAST_PLOT_ORDER):
             data = table[table["Observable"].eq(observable)].sort_values("Observation fraction")
@@ -881,6 +892,8 @@ def plot_forecasting_curves(
                 ax.plot(data["Observation fraction"], data[column], color="tab:blue", marker="o", linewidth=1.4)
             ax.set_title(observable, fontsize=PLOT_TITLE_FONTSIZE, fontweight="normal")
             ax.set_ylabel(ylabel, fontsize=AXIS_LABEL_FONTSIZE)
+            if shared_ylim is not None:
+                ax.set_ylim(*shared_ylim)
             ax.tick_params(axis="both", labelsize=TICK_LABEL_FONTSIZE)
             ax.grid(True, alpha=0.3)
         for ax in axes.ravel()[2:]:
